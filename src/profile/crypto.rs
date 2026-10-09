@@ -6,10 +6,14 @@ use aes_gcm::Aes256Gcm;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use sha2::{Digest, Sha256};
+#[cfg(unix)]
 use std::fs;
+#[cfg(unix)]
 use std::path::Path;
 
-fn get_machine_id() -> Result<String> {
+
+#[cfg(unix)]
+fn get_platform_key_material() -> Result<String> {
     for path in [
         "/etc/machine-id",
         "/var/lib/dbus/machine-id",
@@ -19,7 +23,8 @@ fn get_machine_id() -> Result<String> {
             if let Ok(content) = fs::read_to_string(path) {
                 let trimmed = content.trim();
                 if !trimmed.is_empty() {
-                    return Ok(trimmed.to_string());
+                    let uid = unsafe { libc::getuid() };
+                    return Ok(format!("{trimmed}:{uid}"));
                 }
             }
         }
@@ -29,14 +34,40 @@ fn get_machine_id() -> Result<String> {
     ))
 }
 
-pub fn derive_profile_key() -> Result<[u8; 32]> {
-    let machine_id = get_machine_id()?;
-    #[cfg(unix)]
-    let uid = unsafe { libc::getuid() };
-    #[cfg(not(unix))]
-    let uid = 1000u32;
+#[cfg(windows)]
+fn get_platform_key_material() -> Result<String> {
+    // 1. Read MachineGuid from registry via PowerShell or env/registry if possible
+    // Try registry via command or standard environment fallbacks
+    use std::process::Command;
+    let output = Command::new("reg")
+        .args(["query", "HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Cryptography", "/v", "MachineGuid"])
+        .output();
 
-    let material = format!("{machine_id}:{uid}");
+    let guid = match output {
+        Ok(out) if out.status.success() => {
+            let s = String::from_utf8_lossy(&out.stdout);
+            s.lines()
+                .find(|l| l.contains("MachineGuid"))
+                .and_then(|l| l.split_whitespace().last())
+                .unwrap_or("")
+                .trim()
+                .to_string()
+        }
+        _ => String::new(),
+    };
+
+    let user = std::env::var("USERNAME").unwrap_or_else(|_| "krm".to_string());
+    if !guid.is_empty() {
+        Ok(format!("{guid}:{user}"))
+    } else {
+        Err(Error::Configuration(
+            "Cannot determine MachineGuid for profile encryption on Windows".into(),
+        ))
+    }
+}
+
+pub fn derive_profile_key() -> Result<[u8; 32]> {
+    let material = get_platform_key_material()?;
 
     let mut hasher = Sha256::new();
     hasher.update(b"sqlicon:kdf:uuid_uid_v1:");
@@ -47,6 +78,7 @@ pub fn derive_profile_key() -> Result<[u8; 32]> {
     key.copy_from_slice(&res);
     Ok(key)
 }
+
 
 /// Decrypts a base64-encoded profile password formatted as `[nonce: 12][tag: 16][ciphertext...]`.
 pub fn decrypt_profile_secret(b64: &str) -> Result<String> {
@@ -126,6 +158,7 @@ pub fn encrypt_profile_secret(plain: &str) -> Result<String> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn test_decrypt_live_vdademo_profile() {
         // From ~/.config/sqlicon/profiles.conf:
@@ -133,6 +166,7 @@ mod tests {
         let plain = decrypt_profile_secret(enc).unwrap();
         assert_eq!(plain, "admin");
     }
+
 
     #[test]
     fn test_roundtrip_encryption() {
