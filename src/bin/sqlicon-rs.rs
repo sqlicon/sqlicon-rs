@@ -600,11 +600,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         let trimmed = line.trim();
-        if trimmed.eq_ignore_ascii_case("exit") || trimmed.eq_ignore_ascii_case("quit") {
-            break;
-        }
         if trimmed.is_empty() {
             continue;
+        }
+
+        if trimmed.starts_with('.') {
+            if handle_dot_command(&mut conn, trimmed).await? {
+                break;
+            }
+            continue;
+        }
+
+        if trimmed.eq_ignore_ascii_case("exit") || trimmed.eq_ignore_ascii_case("quit") {
+            break;
         }
 
         if let Err(e) = execute_script(&mut conn, trimmed).await {
@@ -614,3 +622,71 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+
+async fn handle_dot_command(conn: &mut Connection, line: &str) -> Result<bool, Box<dyn std::error::Error>> {
+    let mut parts = line.split_whitespace();
+    let cmd = parts.next().unwrap_or("");
+    let arg = parts.next().unwrap_or("");
+
+    match cmd {
+        ".quit" | ".exit" => return Ok(true),
+        ".help" => {
+            println!("Dot commands:");
+            println!("  .help                 Show this help");
+            println!("  .quit | .exit         Exit shell");
+            println!("  .tables               List user tables");
+            println!("  .databases            List available databases");
+            println!("  .schema TABLE         Show columns and types for TABLE");
+            println!("  .finderr CODE         Show Informix error message description");
+        }
+        ".tables" => {
+            let sql = "SELECT tabname FROM systables WHERE tabid >= 100 AND tabtype = 'T' ORDER BY tabname";
+            match conn.query(sql).await {
+                Ok(res) => print_table(&res),
+                Err(e) => eprintln!("error: {e}"),
+            }
+        }
+        ".databases" => {
+            let sql = "SELECT name FROM sysmaster:sysdatabases ORDER BY name";
+            match conn.query(sql).await {
+                Ok(res) => print_table(&res),
+                Err(e) => eprintln!("error: {e}"),
+            }
+        }
+        ".schema" => {
+            if arg.is_empty() {
+                eprintln!("error: .schema requires table name");
+            } else {
+                let sql = format!("SELECT FIRST 1 * FROM {arg} WHERE 1=0");
+                match conn.query(&sql).await {
+                    Ok(res) => {
+                        println!("Columns for table '{arg}':");
+                        for col in &res.columns {
+                            let tname = col.type_name.as_deref().unwrap_or_else(|| col.col_type.name());
+                            println!("  {} ({})", col.name, tname);
+                        }
+                    }
+                    Err(e) => eprintln!("error: {e}"),
+                }
+            }
+        }
+        ".finderr" => {
+            if arg.is_empty() {
+                eprintln!("usage: .finderr <error_code>");
+            } else if let Ok(code) = arg.parse::<i32>() {
+                if let Some(msg) = sqlicon_rs::lookup_error_message(code) {
+                    println!("[{code}] {msg}");
+                } else {
+                    println!("[{code}] Unknown error code.");
+                }
+            } else {
+                eprintln!("error: error code must be an integer");
+            }
+        }
+        other => {
+            eprintln!("error: unknown dot-command '{other}'. Type '.help' for available commands.");
+        }
+    }
+    Ok(false)
+}
+
