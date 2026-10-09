@@ -7,10 +7,13 @@ use std::fmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u16)]
 pub enum Opcode {
+    DbopenFlags = 0,
     Command = 1,
     Prepare = 2,
+    Curname = 3,
     Id = 4,
     Bind = 5,
+    Open = 6,
     Execute = 7,
     Describe = 8,
     Nfetch = 9,
@@ -63,10 +66,13 @@ pub enum Opcode {
 impl Opcode {
     pub const fn name(&self) -> &'static str {
         match self {
+            Self::DbopenFlags => "SQ_DBOPEN_FLAGS",
             Self::Command => "SQ_COMMAND",
             Self::Prepare => "SQ_PREPARE",
+            Self::Curname => "SQ_CURNAME",
             Self::Id => "SQ_ID",
             Self::Bind => "SQ_BIND",
+            Self::Open => "SQ_OPEN",
             Self::Execute => "SQ_EXECUTE",
             Self::Describe => "SQ_DESCRIBE",
             Self::Nfetch => "SQ_NFETCH",
@@ -119,10 +125,13 @@ impl Opcode {
 
     pub const fn from_u16(val: u16) -> Option<Self> {
         match val {
+            0 => Some(Self::DbopenFlags),
             1 => Some(Self::Command),
             2 => Some(Self::Prepare),
+            3 => Some(Self::Curname),
             4 => Some(Self::Id),
             5 => Some(Self::Bind),
+            6 => Some(Self::Open),
             7 => Some(Self::Execute),
             8 => Some(Self::Describe),
             9 => Some(Self::Nfetch),

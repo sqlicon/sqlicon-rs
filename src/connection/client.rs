@@ -13,7 +13,7 @@ use crate::statement::PreparedStatement;
 use crate::transport::SqliStream;
 use crate::types::column_type::ColumnType;
 use bytes::{BufMut, BytesMut};
-use tracing::{debug, info};
+use tracing::{debug, info, trace};
 
 /// Connection state matching Informix client lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,6 +24,67 @@ pub enum ConnectionState {
     Ready,
     InTransaction,
     Error,
+}
+
+#[derive(Default, Debug)]
+pub struct TurnResult {
+    pub statement_type: u16,
+    pub statement_id: u16,
+    pub columns: Vec<ColumnInfo>,
+    pub rows: Vec<Row>,
+    pub rows_affected: i64,
+    pub row_id: i64,
+    pub warnings: u16,
+    pub saw_done: bool,
+}
+
+pub fn is_likely_opcode(v: u16) -> bool {
+    matches!(
+        v,
+        0   // SQLI_SQ_DBOPEN_FLAGS
+        | 1 // SQLI_SQ_COMMAND
+        | 2 // SQLI_SQ_PREPARE
+        | 3 // SQLI_SQ_CURNAME
+        | 4 // SQLI_SQ_ID
+        | 5 // SQLI_SQ_BIND
+        | 6 // SQLI_SQ_OPEN
+        | 7 // SQLI_SQ_EXECUTE
+        | 8 // SQLI_SQ_DESCRIBE
+        | 9 // SQLI_SQ_NFETCH
+        | 10 // SQLI_SQ_CLOSE
+        | 11 // SQLI_SQ_RELEASE
+        | 12 // SQLI_SQ_EOT
+        | 13 // SQLI_SQ_ERR
+        | 14 // SQLI_SQ_TUPLE
+        | 15 // SQLI_SQ_DONE
+        | 16 // SQLI_SQ_BEGIN
+        | 19 // SQLI_SQ_RET_TYPE
+        | 22 // SQLI_SQ_NDESCRIBE
+        | 25 // SQLI_SQ_TUPID
+        | 36 // SQLI_SQ_DBOPEN
+        | 37 // SQLI_SQ_DBCLOSE
+        | 49 // SQLI_SQ_WANTDONE
+        | 55 // SQLI_SQ_COST
+        | 56 // SQLI_SQ_EXIT
+        | 81 // SQLI_SQ_INFO
+        | 94 // SQLI_SQ_INSERTDONE
+        | 99 // SQLI_SQ_XACTSTAT
+    )
+}
+
+pub fn is_cost_follow_opcode(v: u16) -> bool {
+    matches!(
+        v,
+        12   // SQ_EOT
+        | 15 // SQ_DONE
+        | 13 // SQ_ERR
+        | 14 // SQ_TUPLE
+        | 8  // SQ_DESCRIBE
+        | 81 // SQ_INFO
+        | 94 // SQ_INSERTDONE
+        | 99 // SQ_XACTSTAT
+        | 56 // SQ_EXIT
+    )
 }
 
 pub struct Connection {
@@ -167,28 +228,22 @@ impl Connection {
             stream.write_all(&dbopen_pkt).await?;
             stream.flush().await?;
 
-            // Read DBOPEN responses until Done
-            loop {
-                let op = stream.read_u16().await?;
-                if op == Opcode::Done as u16 || op == Opcode::Eot as u16 {
-                    break;
-                } else if op == Opcode::Err as u16 {
-                    let err_len = stream.read_u16().await? as usize;
-                    let to_drain = err_len + if err_len % 2 != 0 { 1 } else { 0 };
-                    stream.drain(to_drain).await?;
-                    return Err(Error::Server {
-                        sqlcode: -1,
-                        isamcode: 0,
-                        sqlstate: "".into(),
-                        message: format!("Failed to open database {db_name}"),
-                    });
-                } else {
-                    // Drain generic SQ message with length prefix
-                    let msg_len = stream.read_u16().await? as usize;
-                    let to_drain = msg_len + if msg_len % 2 != 0 { 1 } else { 0 };
-                    stream.drain(to_drain).await?;
-                }
-            }
+            let mut conn = Self {
+                stream,
+                params: params.clone(),
+                capabilities: caps,
+                state: ConnectionState::Connecting,
+            };
+
+            // First turn for DBOPEN (reads DBOPEN_FLAGS, COMMAND, DONE, COST, etc. up to EOT)
+            conn.dispatch_turn(TurnResult::default()).await?;
+
+            // Drain any pending data from second turn if available
+            conn.drain_pending_turns().await?;
+
+            conn.state = ConnectionState::Ready;
+            info!("Informix connection successfully established");
+            return Ok(conn);
         }
 
         info!("Informix connection successfully established");
@@ -212,8 +267,314 @@ impl Connection {
         &self.params
     }
 
+    async fn read_str(&mut self) -> Result<String> {
+        let len = self.stream.read_u16().await? as usize;
+        if len == 0 {
+            return Ok(String::new());
+        }
+        let bytes = self.stream.read_bytes(len).await?;
+        if len % 2 != 0 {
+            self.stream.drain(1).await?;
+        }
+        Ok(String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    async fn handle_cost(&mut self) -> Result<()> {
+        if let Some(next) = self.stream.peek_u16(10).await? {
+            if is_cost_follow_opcode(next) {
+                return Ok(());
+            }
+        }
+        let _est_rows = self.stream.read_u32().await?;
+        let _cost = self.stream.read_u32().await?;
+        Ok(())
+    }
+
+    async fn drain_info(&mut self) -> Result<()> {
+        loop {
+            let item_type = self.stream.read_u16().await?;
+            if item_type == 0 {
+                break;
+            }
+            let data_len = self.stream.read_u16().await? as usize;
+            let pad = if data_len % 2 != 0 { 1 } else { 0 };
+            self.stream.drain(data_len + pad).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn drain_pending_turns(&mut self) -> Result<()> {
+        for _ in 0..8 {
+            if let Some(_next) = self.stream.peek_u16(15).await? {
+                self.dispatch_turn(TurnResult::default()).await?;
+            } else {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Central dispatch loop for an Informix SQLI message turn.
+    pub async fn dispatch_turn(&mut self, mut turn: TurnResult) -> Result<TurnResult> {
+        let mut eof = false;
+
+        while !eof {
+            let opcode = self.stream.read_u16().await?;
+            trace!("dispatch read opcode: {opcode}");
+
+            match opcode {
+                0 => {
+                    // SQ_DBOPEN_FLAGS
+                    let _flags = self.stream.read_u16().await?;
+                }
+                1 => {
+                    // SQ_COMMAND
+                    if let Some(next) = self.stream.peek_u16(10).await? {
+                        if !is_likely_opcode(next) {
+                            let _payload = self.stream.read_u32().await?;
+                        }
+                    } else {
+                        let _payload = self.stream.read_u32().await?;
+                    }
+                }
+                2 => {
+                    // SQ_PREPARE ack
+                }
+                6 => {
+                    // SQ_OPEN ack
+                }
+                8 => {
+                    // SQ_DESCRIBE
+                    turn.statement_type = self.stream.read_u16().await?;
+                    turn.statement_id = self.stream.read_u16().await?;
+                    let _cost_raw = self.stream.read_u32().await?;
+                    let _tuple_size = self.stream.read_u16().await?;
+                    let field_count = self.stream.read_u16().await? as usize;
+
+                    let names_length = if self.capabilities.extended_describe {
+                        self.stream.read_u32().await? as usize
+                    } else {
+                        self.stream.read_u16().await? as usize
+                    };
+
+                    let mut fields_meta = Vec::with_capacity(field_count);
+                    for _ in 0..field_count {
+                        let field_idx = self.stream.read_u32().await? as i32;
+                        let tuple_offset = self.stream.read_u32().await?;
+                        let type_raw = self.stream.read_u16().await?;
+
+                        let encoded_len = if !self.capabilities.extended_describe {
+                            self.stream.read_u16().await? as u32
+                        } else {
+                            let _extended_info = self.stream.read_u32().await?;
+                            let o_len = self.stream.read_u16().await? as usize;
+                            if o_len > 0 { self.stream.drain(o_len).await?; }
+                            if o_len % 2 != 0 { self.stream.drain(1).await?; }
+                            let n_len = self.stream.read_u16().await? as usize;
+                            if n_len > 0 { self.stream.drain(n_len).await?; }
+                            if n_len % 2 != 0 { self.stream.drain(1).await?; }
+                            let _reference = self.stream.read_u16().await?;
+                            let _alignment = self.stream.read_u16().await?;
+                            let _source_type = self.stream.read_u32().await?;
+                            self.stream.read_u32().await?
+                        };
+
+                        fields_meta.push((field_idx, tuple_offset, type_raw, encoded_len));
+                    }
+
+                    let names_buf = if names_length > 0 {
+                        self.stream.read_bytes(names_length).await?
+                    } else {
+                        BytesMut::new()
+                    };
+                    if names_length % 2 != 0 {
+                        self.stream.drain(1).await?;
+                    }
+
+                    turn.columns.clear();
+                    let mut name_offset = 0;
+                    for (field_idx, tuple_offset, type_raw, encoded_len) in fields_meta {
+                        let col_name = if name_offset < names_buf.len() {
+                            let start = name_offset;
+                            let end = names_buf[start..]
+                                .iter()
+                                .position(|&b| b == 0)
+                                .map(|p| start + p)
+                                .unwrap_or(names_buf.len());
+                            let n = String::from_utf8_lossy(&names_buf[start..end]).to_string();
+                            name_offset = (end + 1).min(names_buf.len());
+                            n
+                        } else {
+                            format!("col_{field_idx}")
+                        };
+
+                        let col_type = ColumnType::from_raw(type_raw).unwrap_or(ColumnType::Char);
+                        turn.columns.push(ColumnInfo::new(
+                            col_name,
+                            col_type,
+                            type_raw,
+                            encoded_len,
+                            tuple_offset,
+                            field_idx,
+                        ));
+                    }
+                }
+                10 | 11 => {
+                    // SQ_CLOSE, SQ_RELEASE
+                }
+                12 => {
+                    // SQ_EOT
+                    if let Some(_next) = self.stream.peek_u16(10).await? {
+                        // More data follow in this turn
+                    } else {
+                        eof = true;
+                    }
+                }
+                13 => {
+                    // SQ_ERR
+                    let sqlcode = self.stream.read_u16().await? as i16;
+                    let isamcode = self.stream.read_u16().await? as i16;
+                    let remove64k = self.capabilities.remove_64k_limit;
+                    let (sqlstate, message) = if sqlcode == -619 {
+                        self.stream.drain(if remove64k { 6 } else { 4 }).await?;
+                        let msg = self.read_str().await?;
+                        ("".to_string(), msg)
+                    } else if sqlcode == -368 {
+                        ("".to_string(), "".to_string())
+                    } else if sqlcode == 0 || sqlcode == -937 || sqlcode == 100 {
+                        let mut st = [0u8; 5];
+                        self.stream.read_exact(&mut st).await?;
+                        let msg = self.read_str().await?;
+                        (String::from_utf8_lossy(&st).to_string(), msg)
+                    } else {
+                        self.stream.drain(if remove64k { 4 } else { 2 }).await?;
+                        let msg = self.read_str().await?;
+                        ("".to_string(), msg)
+                    };
+
+                    if let Some(12) = self.stream.peek_u16(10).await? {
+                        let _ = self.stream.read_u16().await?;
+                    }
+
+                    return Err(Error::Server {
+                        sqlcode: sqlcode as i32,
+                        isamcode: isamcode as i32,
+                        sqlstate,
+                        message,
+                    });
+                }
+                14 => {
+                    // SQ_TUPLE
+                    let _warn = self.stream.read_u16().await?;
+                    let tuple_size = self.stream.read_u32().await? as usize;
+                    let tuple_bytes = self.stream.read_bytes(tuple_size).await?;
+                    if tuple_size % 2 != 0 {
+                        self.stream.drain(1).await?;
+                    }
+                    turn.rows.push(Row::new(tuple_bytes.to_vec(), turn.columns.clone()));
+                }
+                15 => {
+                    // SQ_DONE
+                    turn.warnings = self.stream.read_u16().await?;
+                    if self.capabilities.long_row_id {
+                        let mut b8 = [0u8; 8];
+                        self.stream.read_exact(&mut b8).await?;
+                        turn.rows_affected = i64::from_be_bytes(b8);
+                        self.stream.read_exact(&mut b8).await?;
+                        turn.row_id = i64::from_be_bytes(b8);
+                    } else {
+                        let mut b4 = [0u8; 4];
+                        self.stream.read_exact(&mut b4).await?;
+                        turn.rows_affected = i32::from_be_bytes(b4) as i64;
+                        self.stream.read_exact(&mut b4).await?;
+                        turn.row_id = i32::from_be_bytes(b4) as i64;
+                    }
+                    let _errd1 = self.stream.read_u32().await?;
+
+                    // Adaptive tail peek for errd2, errd3
+                    if let Some(next) = self.stream.peek_u16(10).await? {
+                        if !is_likely_opcode(next) && next != 0 {
+                            let _errd2 = self.stream.read_u32().await?;
+                            let _errd3 = self.stream.read_u32().await?;
+                        }
+                    }
+
+                    // Drain trailing SQ_COST, SQ_INFO, SQ_DBOPEN_FLAGS, SQ_EOT if already buffered
+                    loop {
+                        if let Some(next) = self.stream.peek_u16(10).await? {
+                            match next {
+                                55 => {
+                                    self.stream.read_u16().await?;
+                                    self.handle_cost().await?;
+                                }
+                                81 => {
+                                    self.stream.read_u16().await?;
+                                    self.drain_info().await?;
+                                }
+                                0 => {
+                                    self.stream.read_u16().await?;
+                                    let _ = self.stream.read_u16().await?;
+                                }
+                                12 => {
+                                    self.stream.read_u16().await?;
+                                    break;
+                                }
+                                _ => break,
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+
+                    turn.saw_done = true;
+                    eof = true;
+                }
+                25 => {
+                    // SQ_TUPID
+                    let _tupid = self.stream.read_u32().await?;
+                }
+                36 => {
+                    // SQ_DBOPEN echo
+                    let name_len = self.stream.read_u16().await? as usize;
+                    self.stream.drain(name_len + 2).await?;
+                    let _eot = self.stream.read_u16().await?;
+                }
+                37 => {
+                    // SQ_DBCLOSE
+                }
+                55 => {
+                    // SQ_COST
+                    self.handle_cost().await?;
+                }
+                56 => {
+                    // SQ_EXIT
+                    return Err(Error::Protocol("Server sent SQ_EXIT".into()));
+                }
+                81 => {
+                    // SQ_INFO
+                    self.drain_info().await?;
+                }
+                94 => {
+                    // SQ_INSERTDONE
+                    self.stream.drain(10).await?;
+                }
+                99 => {
+                    // SQ_XACTSTAT
+                    self.stream.drain(6).await?;
+                }
+                other => {
+                    return Err(Error::Protocol(format!("Unhandled opcode: {other}")));
+                }
+            }
+        }
+
+        Ok(turn)
+    }
+
     /// Prepares an SQL statement on the server.
     pub async fn prepare(&mut self, sql: &str) -> Result<PreparedStatement> {
+        self.drain_pending_turns().await?;
+
         let qmarks = sql.chars().filter(|&c| c == '?').count() as u16;
         let sql_bytes = sql.as_bytes();
 
@@ -239,128 +600,13 @@ impl Connection {
         self.stream.write_all(&pkt).await?;
         self.stream.flush().await?;
 
-        // Read response until DONE / EOT
-        let mut statement_type = 0;
-        let mut statement_id = 0;
-        let mut columns = Vec::new();
-
-        loop {
-            let op = self.stream.read_u16().await?;
-            if op == Opcode::Describe as u16 {
-                statement_type = self.stream.read_u16().await?;
-                statement_id = self.stream.read_u16().await?;
-                let _cost_raw = self.stream.read_u32().await?;
-                let _tuple_size = self.stream.read_u16().await?;
-                let field_count = self.stream.read_u16().await? as usize;
-
-                let names_length = if self.capabilities.extended_describe {
-                    self.stream.read_u32().await? as usize
-                } else {
-                    self.stream.read_u16().await? as usize
-                };
-
-                let mut fields_meta = Vec::with_capacity(field_count);
-                for _ in 0..field_count {
-                    let field_idx = self.stream.read_u32().await? as i32;
-                    let tuple_offset = self.stream.read_u32().await?;
-                    let type_raw = self.stream.read_u16().await?;
-
-                    let encoded_len = if !self.capabilities.extended_describe {
-                        self.stream.read_u16().await? as u32
-                    } else {
-                        let _extended_info = self.stream.read_u32().await?;
-                        // Read type_owner string
-                        let o_len = self.stream.read_u16().await? as usize;
-                        if o_len > 0 { self.stream.drain(o_len).await?; }
-                        if o_len % 2 != 0 { self.stream.drain(1).await?; }
-                        // Read type_name string
-                        let n_len = self.stream.read_u16().await? as usize;
-                        if n_len > 0 { self.stream.drain(n_len).await?; }
-                        if n_len % 2 != 0 { self.stream.drain(1).await?; }
-
-                        let _reference = self.stream.read_u16().await?;
-                        let _alignment = self.stream.read_u16().await?;
-                        let _source_type = self.stream.read_u32().await?;
-                        self.stream.read_u32().await?
-                    };
-
-                    fields_meta.push((field_idx, tuple_offset, type_raw, encoded_len));
-                }
-
-                // Read column names
-                let names_buf = if names_length > 0 {
-                    self.stream.read_bytes(names_length).await?
-                } else {
-                    BytesMut::new()
-                };
-                if names_length % 2 != 0 {
-                    self.stream.drain(1).await?;
-                }
-
-                // Parse names
-                let mut name_offset = 0;
-                for (field_idx, tuple_offset, type_raw, encoded_len) in fields_meta {
-                    let col_name = if name_offset < names_buf.len() {
-                        let start = name_offset;
-                        let end = names_buf[start..]
-                            .iter()
-                            .position(|&b| b == 0)
-                            .map(|p| start + p)
-                            .unwrap_or(names_buf.len());
-                        let n = String::from_utf8_lossy(&names_buf[start..end]).to_string();
-                        name_offset = (end + 1).min(names_buf.len());
-                        n
-                    } else {
-                        format!("col_{field_idx}")
-                    };
-
-                    let col_type = ColumnType::from_raw(type_raw).unwrap_or(ColumnType::Char);
-                    columns.push(ColumnInfo::new(
-                        col_name,
-                        col_type,
-                        type_raw,
-                        encoded_len,
-                        tuple_offset,
-                        field_idx,
-                    ));
-                }
-            } else if op == Opcode::Done as u16 {
-                let _warnings = self.stream.read_u16().await?;
-                if self.capabilities.long_row_id {
-                    let _ = self.stream.read_bytes(16).await?; // rows + rowid
-                } else {
-                    let _ = self.stream.read_bytes(8).await?;
-                }
-                let _errd1 = self.stream.read_u32().await?;
-            } else if op == Opcode::Err as u16 {
-                let sqlcode = self.stream.read_u16().await? as i16;
-                let isamcode = self.stream.read_u16().await? as i16;
-                let drain_len = if self.capabilities.remove_64k_limit { 4 } else { 2 };
-                self.stream.drain(drain_len).await?;
-                let msg_len = self.stream.read_u16().await? as usize;
-                let msg_bytes = self.stream.read_bytes(msg_len).await?;
-                let message = String::from_utf8_lossy(&msg_bytes).to_string();
-                return Err(Error::Server {
-                    sqlcode: sqlcode as i32,
-                    isamcode: isamcode as i32,
-                    sqlstate: "".into(),
-                    message,
-                });
-            } else if op == Opcode::Eot as u16 {
-                break;
-            } else {
-                // Drain unknown SQ message
-                let msg_len = self.stream.read_u16().await? as usize;
-                let to_drain = msg_len + if msg_len % 2 != 0 { 1 } else { 0 };
-                self.stream.drain(to_drain).await?;
-            }
-        }
+        let turn = self.dispatch_turn(TurnResult::default()).await?;
 
         Ok(PreparedStatement::new(
-            statement_id,
-            statement_type,
+            turn.statement_id,
+            turn.statement_type,
             qmarks as usize,
-            columns,
+            turn.columns,
         ))
     }
 
@@ -379,49 +625,9 @@ impl Connection {
         self.stream.write_all(&exec_pkt).await?;
         self.stream.flush().await?;
 
-        let mut rows_affected: i64 = 0;
-
-        loop {
-            let op = self.stream.read_u16().await?;
-            if op == Opcode::Done as u16 {
-                let _warnings = self.stream.read_u16().await?;
-                if self.capabilities.long_row_id {
-                    let mut b = [0u8; 8];
-                    self.stream.read_exact(&mut b).await?;
-                    rows_affected = i64::from_be_bytes(b);
-                    self.stream.drain(8).await?; // row_id
-                } else {
-                    let mut b = [0u8; 4];
-                    self.stream.read_exact(&mut b).await?;
-                    rows_affected = i32::from_be_bytes(b) as i64;
-                    self.stream.drain(4).await?; // row_id
-                }
-                let _errd1 = self.stream.read_u32().await?;
-            } else if op == Opcode::Err as u16 {
-                let sqlcode = self.stream.read_u16().await? as i16;
-                let isamcode = self.stream.read_u16().await? as i16;
-                let drain_len = if self.capabilities.remove_64k_limit { 4 } else { 2 };
-                self.stream.drain(drain_len).await?;
-                let msg_len = self.stream.read_u16().await? as usize;
-                let msg_bytes = self.stream.read_bytes(msg_len).await?;
-                let message = String::from_utf8_lossy(&msg_bytes).to_string();
-                return Err(Error::Server {
-                    sqlcode: sqlcode as i32,
-                    isamcode: isamcode as i32,
-                    sqlstate: "".into(),
-                    message,
-                });
-            } else if op == Opcode::Eot as u16 {
-                break;
-            } else {
-                let msg_len = self.stream.read_u16().await? as usize;
-                let to_drain = msg_len + if msg_len % 2 != 0 { 1 } else { 0 };
-                self.stream.drain(to_drain).await?;
-            }
-        }
-
+        let turn = self.dispatch_turn(TurnResult::default()).await?;
         self.close_statement(stmt_id).await?;
-        Ok(rows_affected)
+        Ok(turn.rows_affected)
     }
 
     /// Executes a SELECT query and returns the complete QueryResult.
@@ -435,82 +641,56 @@ impl Connection {
         let mut open_pkt = BytesMut::with_capacity(32);
         open_pkt.put_u16(Opcode::Id as u16);
         open_pkt.put_u16(stmt_id);
-        open_pkt.put_u16(3); // SQ_CURNAME
+        open_pkt.put_u16(Opcode::Curname as u16); // 3
         open_pkt.put_u16(curname.len() as u16);
         open_pkt.put_slice(curname);
         if curname.len() % 2 != 0 {
             open_pkt.put_u8(0);
         }
-        open_pkt.put_u16(6); // SQ_OPEN
+        open_pkt.put_u16(Opcode::Open as u16); // 6
         open_pkt.put_u16(Opcode::Eot as u16);
 
         self.stream.write_all(&open_pkt).await?;
         self.stream.flush().await?;
 
-        // 2. Fetch rows
-        let mut fetch_pkt = BytesMut::with_capacity(16);
-        fetch_pkt.put_u16(Opcode::Id as u16);
-        fetch_pkt.put_u16(stmt_id);
-        fetch_pkt.put_u16(Opcode::Nfetch as u16); // 9
-        fetch_pkt.put_u16(1000); // target rows
-        fetch_pkt.put_u16(Opcode::Eot as u16);
+        // Receive OPEN ack turn
+        let _ = self.dispatch_turn(TurnResult::default()).await?;
 
-        self.stream.write_all(&fetch_pkt).await?;
-        self.stream.flush().await?;
-
-        let mut rows = Vec::new();
-        let mut rows_affected: i64 = 0;
-        let mut warnings: u16 = 0;
+        // 2. Fetch rows loop
+        let mut all_rows = Vec::new();
+        let rows_affected;
+        let last_warnings;
 
         loop {
-            let op = self.stream.read_u16().await?;
-            if op == Opcode::Tuple as u16 {
-                let _warn = self.stream.read_u16().await?;
-                let tuple_size = self.stream.read_u32().await? as usize;
-                let tuple_bytes = self.stream.read_bytes(tuple_size).await?;
-                if tuple_size % 2 != 0 {
-                    self.stream.drain(1).await?;
-                }
-                rows.push(Row::new(tuple_bytes.to_vec(), columns.clone()));
-            } else if op == Opcode::Done as u16 {
-                warnings = self.stream.read_u16().await?;
-                if self.capabilities.long_row_id {
-                    let mut b = [0u8; 8];
-                    self.stream.read_exact(&mut b).await?;
-                    rows_affected = i64::from_be_bytes(b);
-                    self.stream.drain(8).await?;
-                } else {
-                    let mut b = [0u8; 4];
-                    self.stream.read_exact(&mut b).await?;
-                    rows_affected = i32::from_be_bytes(b) as i64;
-                    self.stream.drain(4).await?;
-                }
-                let _errd1 = self.stream.read_u32().await?;
-            } else if op == Opcode::Err as u16 {
-                let sqlcode = self.stream.read_u16().await? as i16;
-                let isamcode = self.stream.read_u16().await? as i16;
-                let drain_len = if self.capabilities.remove_64k_limit { 4 } else { 2 };
-                self.stream.drain(drain_len).await?;
-                let msg_len = self.stream.read_u16().await? as usize;
-                let msg_bytes = self.stream.read_bytes(msg_len).await?;
-                let message = String::from_utf8_lossy(&msg_bytes).to_string();
-                return Err(Error::Server {
-                    sqlcode: sqlcode as i32,
-                    isamcode: isamcode as i32,
-                    sqlstate: "".into(),
-                    message,
-                });
-            } else if op == Opcode::Eot as u16 {
+            let prev_count = all_rows.len();
+
+            let fetch_bufsize = 32768u32;
+            let mut fetch_pkt = BytesMut::with_capacity(16);
+            fetch_pkt.put_u16(Opcode::Id as u16);
+            fetch_pkt.put_u16(stmt_id);
+            fetch_pkt.put_u16(Opcode::Nfetch as u16); // 9
+            fetch_pkt.put_u32(fetch_bufsize);
+            fetch_pkt.put_u16(0); // array_size = 0
+            fetch_pkt.put_u16(Opcode::Eot as u16);
+
+            self.stream.write_all(&fetch_pkt).await?;
+            self.stream.flush().await?;
+
+            let mut turn = TurnResult::default();
+            turn.columns = columns.clone();
+            turn = self.dispatch_turn(turn).await?;
+
+            all_rows.extend(turn.rows);
+
+            if all_rows.len() == prev_count || turn.saw_done {
+                rows_affected = turn.rows_affected;
+                last_warnings = turn.warnings;
                 break;
-            } else {
-                let msg_len = self.stream.read_u16().await? as usize;
-                let to_drain = msg_len + if msg_len % 2 != 0 { 1 } else { 0 };
-                self.stream.drain(to_drain).await?;
             }
         }
 
         self.close_statement(stmt_id).await?;
-        Ok(QueryResult::new(columns, rows, rows_affected, None, warnings))
+        Ok(QueryResult::new(columns, all_rows, rows_affected, None, last_warnings))
     }
 
     /// Closes and releases a statement on the server.

@@ -3,11 +3,13 @@
 use crate::error::{Error, Result};
 use crate::protocol::sl_header::SlHeader;
 use bytes::BytesMut;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 pub struct SqliStream {
     stream: TcpStream,
+    buf: BytesMut,
 }
 
 impl SqliStream {
@@ -15,11 +17,53 @@ impl SqliStream {
         let addr = format!("{host}:{port}");
         let stream = TcpStream::connect(&addr).await.map_err(Error::Io)?;
         let _ = stream.set_nodelay(true);
-        Ok(Self { stream })
+        Ok(Self {
+            stream,
+            buf: BytesMut::with_capacity(8192),
+        })
+    }
+
+    pub fn has_buffered_data(&self) -> bool {
+        !self.buf.is_empty()
+    }
+
+    pub fn buffered_len(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// Non-blocking attempt to read any immediately available socket data into `self.buf`.
+    pub fn try_fill_buf(&mut self) {
+        let mut chunk = [0u8; 4096];
+        loop {
+            match self.stream.try_read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => self.buf.extend_from_slice(&chunk[..n]),
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => break,
+            }
+        }
+    }
+
+    /// Ensures that `self.buf` contains at least `needed` bytes.
+    pub async fn ensure_buffered(&mut self, needed: usize) -> Result<()> {
+        while self.buf.len() < needed {
+            let mut chunk = [0u8; 4096];
+            let n = self.stream.read(&mut chunk).await.map_err(Error::Io)?;
+            if n == 0 {
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "Connection closed by server while waiting for data",
+                )));
+            }
+            self.buf.extend_from_slice(&chunk[..n]);
+        }
+        Ok(())
     }
 
     pub async fn read_exact(&mut self, buf: &mut [u8]) -> Result<()> {
-        self.stream.read_exact(buf).await.map_err(Error::Io)?;
+        self.ensure_buffered(buf.len()).await?;
+        let bytes = self.buf.split_to(buf.len());
+        buf.copy_from_slice(&bytes);
         Ok(())
     }
 
@@ -36,19 +80,49 @@ impl SqliStream {
     }
 
     pub async fn read_bytes(&mut self, count: usize) -> Result<BytesMut> {
-        let mut buf = BytesMut::zeroed(count);
-        self.read_exact(&mut buf).await?;
-        Ok(buf)
+        self.ensure_buffered(count).await?;
+        Ok(self.buf.split_to(count))
     }
 
-    pub async fn drain(&mut self, mut count: usize) -> Result<()> {
-        let mut temp = [0u8; 256];
-        while count > 0 {
-            let chunk = count.min(temp.len());
-            self.read_exact(&mut temp[..chunk]).await?;
-            count -= chunk;
-        }
+    pub async fn drain(&mut self, count: usize) -> Result<()> {
+        let _ = self.read_bytes(count).await?;
         Ok(())
+    }
+
+    /// Peeks `N` bytes from the buffer, attempting to read from socket within `timeout_ms` if not enough bytes.
+    pub async fn peek_array<const N: usize>(&mut self, timeout_ms: u64) -> Result<Option<[u8; N]>> {
+        self.try_fill_buf();
+        if self.buf.len() >= N {
+            let mut out = [0u8; N];
+            out.copy_from_slice(&self.buf[..N]);
+            return Ok(Some(out));
+        }
+        if timeout_ms > 0 {
+            let fut = async {
+                while self.buf.len() < N {
+                    let mut chunk = [0u8; 4096];
+                    let n = self.stream.read(&mut chunk).await?;
+                    if n == 0 {
+                        break;
+                    }
+                    self.buf.extend_from_slice(&chunk[..n]);
+                }
+                std::io::Result::Ok(())
+            };
+            let _ = tokio::time::timeout(Duration::from_millis(timeout_ms), fut).await;
+        }
+        if self.buf.len() >= N {
+            let mut out = [0u8; N];
+            out.copy_from_slice(&self.buf[..N]);
+            Ok(Some(out))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub async fn peek_u16(&mut self, timeout_ms: u64) -> Result<Option<u16>> {
+        let arr = self.peek_array::<2>(timeout_ms).await?;
+        Ok(arr.map(u16::from_be_bytes))
     }
 
     pub async fn write_all(&mut self, buf: &[u8]) -> Result<()> {

@@ -13,14 +13,85 @@ use crate::types::temporal_wire_size;
 pub struct Row {
     pub(crate) tuple_data: Vec<u8>,
     pub(crate) columns: Vec<ColumnInfo>,
+    pub(crate) col_offsets: Vec<usize>,
 }
 
 impl Row {
     pub fn new(tuple_data: Vec<u8>, columns: Vec<ColumnInfo>) -> Self {
+        let col_offsets = Self::calculate_col_offsets(&tuple_data, &columns);
         Self {
             tuple_data,
             columns,
+            col_offsets,
         }
+    }
+
+    fn calculate_col_offsets(tuple_data: &[u8], columns: &[ColumnInfo]) -> Vec<usize> {
+        let mut offsets = Vec::with_capacity(columns.len());
+        let mut offset = 0;
+
+        for col in columns {
+            offsets.push(offset);
+            if offset >= tuple_data.len() {
+                continue;
+            }
+
+            let span = match col.col_type {
+                ColumnType::VarChar | ColumnType::NVarChar => {
+                    let len = tuple_data[offset] as usize;
+                    1 + len
+                }
+                ColumnType::Bool | ColumnType::DBoolean | ColumnType::LVarChar | ColumnType::Blob | ColumnType::Clob => {
+                    if offset + 5 <= tuple_data.len() {
+                        let len = u32::from_be_bytes([
+                            tuple_data[offset + 1],
+                            tuple_data[offset + 2],
+                            tuple_data[offset + 3],
+                            tuple_data[offset + 4],
+                        ]) as usize;
+                        5 + len
+                    } else if offset + 2 <= tuple_data.len() {
+                        let len = u16::from_be_bytes([tuple_data[offset], tuple_data[offset + 1]]) as usize;
+                        2 + len
+                    } else {
+                        1
+                    }
+                }
+                ColumnType::Char | ColumnType::NChar => {
+                    let width = if col.encoded_length > 0 { col.encoded_length as usize } else { 1 };
+                    if offset + width <= tuple_data.len() {
+                        width
+                    } else {
+                        let len = tuple_data[offset] as usize;
+                        1 + len
+                    }
+                }
+                ColumnType::SmallInt => 2,
+                ColumnType::Int | ColumnType::Serial | ColumnType::Date => 4,
+                ColumnType::Float | ColumnType::BigInt | ColumnType::BigSerial => 8,
+                ColumnType::Int8 | ColumnType::Serial8 => 10,
+                ColumnType::Decimal | ColumnType::Money => {
+                    decimal_wire_size(col.encoded_length as u16).unwrap_or(16)
+                }
+                ColumnType::DateTime => {
+                    temporal_wire_size(col.encoded_length as u16, false).unwrap_or(8)
+                }
+                ColumnType::Interval => {
+                    temporal_wire_size(col.encoded_length as u16, true).unwrap_or(8)
+                }
+                ColumnType::Byte | ColumnType::Text => {
+                    if col.encoded_length > 0 { col.encoded_length as usize } else { 56 }
+                }
+                _ => {
+                    let width = col.encoded_length as usize;
+                    if width > 0 { width } else { 4 }
+                }
+            };
+
+            offset += span;
+        }
+
+        offsets
     }
 
     pub fn column_count(&self) -> usize {
@@ -37,7 +108,7 @@ impl Row {
             Error::OutOfRange(format!("Column index {index} out of range (count: {})", self.columns.len()))
         })?;
 
-        let base = col.col_start_pos as usize;
+        let base = self.col_offsets.get(index).copied().unwrap_or(col.col_start_pos as usize);
         let buf = &self.tuple_data;
         if base >= buf.len() {
             return Err(Error::Protocol(format!(
