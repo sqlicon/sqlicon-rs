@@ -12,7 +12,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[tokio::test]
 async fn test_live_data_types_matrix() {
-    let params = ConnectParams::new("127.0.0.1", "9089", "ol_iep")
+    let host = std::env::var("INFORMIX_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let params = ConnectParams::new(&host, "9089", "ol_iep")
         .database("sqli_log_test")
         .credentials("admin", "admin")
         .locales("de_DE.1252", "de_DE.1252");

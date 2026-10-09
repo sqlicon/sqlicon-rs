@@ -7,7 +7,8 @@ use std::time::Duration;
 
 #[tokio::test]
 async fn test_live_sblob_read_write_seek() {
-    let params = ConnectParams::new("127.0.0.1", "9089", "ol_iep")
+    let host = std::env::var("INFORMIX_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let params = ConnectParams::new(&host, "9089", "ol_iep")
         .database("sqli_log_test")
         .credentials("admin", "admin")
         .locales("de_DE.1252", "de_DE.1252");
@@ -65,7 +66,8 @@ async fn test_live_sblob_read_write_seek() {
 
 #[tokio::test]
 async fn test_live_batch_execution() {
-    let params = ConnectParams::new("127.0.0.1", "9089", "ol_iep")
+    let host = std::env::var("INFORMIX_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let params = ConnectParams::new(&host, "9089", "ol_iep")
         .database("sqli_log_test")
         .credentials("admin", "admin")
         .locales("de_DE.1252", "de_DE.1252");
@@ -120,7 +122,8 @@ async fn test_live_batch_execution() {
 
 #[tokio::test]
 async fn test_live_cancellation_handle() {
-    let params = ConnectParams::new("127.0.0.1", "9089", "ol_iep")
+    let host = std::env::var("INFORMIX_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let params = ConnectParams::new(&host, "9089", "ol_iep")
         .database("sqli_log_test")
         .credentials("admin", "admin")
         .locales("de_DE.1252", "de_DE.1252");
