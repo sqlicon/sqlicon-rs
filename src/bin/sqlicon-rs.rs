@@ -18,6 +18,7 @@ Usage:
 Mode options:
   -c, --command <sql>      Execute inline SQL and exit
   -f, --file <path>        Execute script file and exit
+      --finderr <code>     Look up Informix error code description and exit
   -h, --help               Show this help and exit
   -V, --version            Show the version and exit
 
@@ -32,6 +33,7 @@ Connection/profile options:
       --profile-default <n> Set default profile name
       --show-secret        Show cleartext password in --profile-show
       --yes                Confirm destructive action (--profile-delete)
+      --connect-uri <uri>  Connection URI (onsoctcp/onsocssl/onipcstr)
       --host <name>        Informix host name or IP
       --port <value>       Informix service/port
       --server <name>      Informix server name
@@ -53,6 +55,8 @@ Environment (connection operations):
 struct CliArgs {
     command: Option<String>,
     file: Option<String>,
+    finderr: Option<i32>,
+    connect_uri: Option<String>,
     profile: Option<String>,
     profile_list: bool,
     profile_show: Option<String>,
@@ -93,6 +97,16 @@ fn parse_cli_args() -> Result<CliArgs, String> {
             }
             "-f" | "--file" => {
                 args.file = Some(iter.next().ok_or("Missing argument for --file")?);
+            }
+            "--finderr" => {
+                let code_str = iter.next().ok_or("Missing argument for --finderr")?;
+                let code: i32 = code_str.parse().map_err(|_| {
+                    format!("Invalid error code '{code_str}': must be an integer")
+                })?;
+                args.finderr = Some(code);
+            }
+            "--connect-uri" => {
+                args.connect_uri = Some(iter.next().ok_or("Missing argument for --connect-uri")?);
             }
             "-p" | "--profile" => {
                 args.profile = Some(iter.next().ok_or("Missing argument for --profile")?);
@@ -138,6 +152,13 @@ fn parse_cli_args() -> Result<CliArgs, String> {
                     args.command = Some(val.to_string());
                 } else if let Some(val) = other.strip_prefix("--file=") {
                     args.file = Some(val.to_string());
+                } else if let Some(val) = other.strip_prefix("--finderr=") {
+                    let code: i32 = val.parse().map_err(|_| {
+                        format!("Invalid error code '{val}': must be an integer")
+                    })?;
+                    args.finderr = Some(code);
+                } else if let Some(val) = other.strip_prefix("--connect-uri=") {
+                    args.connect_uri = Some(val.to_string());
                 } else if let Some(val) = other.strip_prefix("--profile=") {
                     args.profile = Some(val.to_string());
                 } else if let Some(val) = other.strip_prefix("--host=") {
@@ -169,6 +190,10 @@ fn parse_cli_args() -> Result<CliArgs, String> {
 }
 
 fn build_connect_params(args: &CliArgs, store: &ProfileStore) -> Result<ConnectParams, String> {
+    if let Some(ref uri) = args.connect_uri {
+        return ConnectParams::from_uri(uri).map_err(|e| e.to_string());
+    }
+
     let profile_target = args
         .profile_test
         .as_deref()
@@ -348,6 +373,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             process::exit(1);
         }
     };
+
+    if let Some(code) = args.finderr {
+        if let Some(desc) = sqlicon_rs::lookup_error_message(code) {
+            println!("[{code}] {desc}");
+        } else {
+            println!("[{code}] Unknown error code.");
+        }
+        return Ok(());
+    }
 
     let mut store = ProfileStore::load().unwrap_or_default();
 

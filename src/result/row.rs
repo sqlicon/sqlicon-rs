@@ -143,7 +143,13 @@ impl Row {
                 // 1-byte length prefix
                 let len = buf[base] as usize;
                 if base + 1 + len <= buf.len() {
-                    Ok(Some(&buf[base + 1..base + 1 + len]))
+                    let payload = &buf[base + 1..base + 1 + len];
+                    // Informix VARCHAR NULL sentinel: [len=1][payload=0x00]
+                    if len == 1 && payload[0] == 0x00 {
+                        Ok(None)
+                    } else {
+                        Ok(Some(payload))
+                    }
                 } else {
                     Err(Error::Protocol("VarChar length exceeds tuple bounds".into()))
                 }
@@ -190,7 +196,13 @@ impl Row {
             ColumnType::Char | ColumnType::NChar => {
                 let width = col.encoded_length as usize;
                 if base + width <= buf.len() {
-                    Ok(Some(&buf[base..base + width]))
+                    let slice = &buf[base..base + width];
+                    // Informix CHAR NULL sentinel: first byte 0x00 and remaining bytes space padding
+                    if width > 0 && slice[0] == 0x00 && slice[1..].iter().all(|&b| b == b' ') {
+                        Ok(None)
+                    } else {
+                        Ok(Some(slice))
+                    }
                 } else {
                     Err(Error::Protocol("Char column exceeds tuple bounds".into()))
                 }
@@ -382,12 +394,33 @@ impl Row {
             Some(r) => r,
             None => return Ok(None),
         };
-        if raw.len() != 8 {
-            return Err(Error::TypeMismatch { expected: "f64", found: "non-8-byte" });
+        if raw.len() == 8 {
+            Ok(Some(f64::from_be_bytes([
+                raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
+            ])))
+        } else if raw.len() == 4 {
+            let f = f32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]);
+            Ok(Some(f as f64))
+        } else {
+            Err(Error::TypeMismatch { expected: "f64", found: "unexpected float length" })
         }
-        Ok(Some(f64::from_be_bytes([
-            raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
-        ])))
+    }
+
+    pub fn get_f32(&self, index: usize) -> Result<Option<f32>> {
+        let raw = match self.get_raw_column(index)? {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+        if raw.len() == 4 {
+            Ok(Some(f32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]])))
+        } else if raw.len() == 8 {
+            let d = f64::from_be_bytes([
+                raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
+            ]);
+            Ok(Some(d as f32))
+        } else {
+            Err(Error::TypeMismatch { expected: "f32", found: "unexpected float length" })
+        }
     }
 
     pub fn get_bool(&self, index: usize) -> Result<Option<bool>> {
@@ -398,7 +431,27 @@ impl Row {
         if raw.is_empty() {
             return Ok(None);
         }
-        Ok(Some(raw[0] != 0))
+        match raw[0] {
+            0 | b'0' | b'f' | b'F' | b'n' | b'N' => Ok(Some(false)),
+            1 | 0xFF | b'1' | b't' | b'T' | b'y' | b'Y' => Ok(Some(true)),
+            _ => Ok(Some(raw[0] != 0)),
+        }
+    }
+
+    pub fn get_interval(&self, index: usize) -> Result<Option<crate::types::datetime::Interval>> {
+        let col = self.columns.get(index).ok_or_else(|| {
+            Error::OutOfRange(format!("Column {index} out of range"))
+        })?;
+        let raw = match self.get_raw_column(index)? {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+        let iv = crate::types::datetime::interval_decode_wire(raw, col.encoded_length as u16)?;
+        if iv.is_null {
+            Ok(None)
+        } else {
+            Ok(Some(iv))
+        }
     }
 
     pub fn get_decimal(&self, index: usize) -> Result<Option<Decimal>> {
