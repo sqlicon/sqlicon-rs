@@ -15,35 +15,62 @@ pub mod flags {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u16)]
 pub enum ColumnType {
+    /// 8-bit ASCII or local character string (`CHAR(n)`).
     Char = 0,
+    /// 16-bit signed integer (`SMALLINT`).
     SmallInt = 1,
+    /// 32-bit signed integer (`INTEGER`).
     Int = 2,
+    /// 64-bit IEEE 754 floating-point number (`FLOAT`).
     Float = 3,
+    /// 32-bit IEEE 754 floating-point number (`SMALLFLOAT`).
     SmallFloat = 4,
+    /// Arbitrary precision packed BCD decimal (`DECIMAL(p,s)`).
     Decimal = 5,
+    /// Auto-incrementing 32-bit integer (`SERIAL`).
     Serial = 6,
+    /// Julian date count (`DATE`).
     Date = 7,
+    /// Currency decimal with default 2-digit scale (`MONEY(p,s)`).
     Money = 8,
+    /// Untyped NULL placeholder.
     Null = 9,
+    /// Calendar timestamp with arbitrary qualifier precision (`DATETIME`).
     DateTime = 10,
+    /// Traditional binary large object (`BYTE`).
     Byte = 11,
+    /// Traditional text large object (`TEXT`).
     Text = 12,
+    /// Variable-length character string up to 255 bytes (`VARCHAR(m,r)`).
     VarChar = 13,
+    /// Span of elapsed time (`INTERVAL`).
     Interval = 14,
+    /// National character string (`NCHAR(n)`).
     NChar = 15,
+    /// Variable-length national character string (`NVARCHAR(m,r)`).
     NVarChar = 16,
+    /// 64-bit Informix INT8 integer.
     Int8 = 17,
+    /// Auto-incrementing 64-bit INT8 integer (`SERIAL8`).
     Serial8 = 18,
+    /// Large variable-length character string up to 32KB (`LVARCHAR`).
     LVarChar = 40,
+    /// 1-byte boolean flag (`BOOLEAN`).
     Bool = 41,
+    /// Distinct boolean UDT type.
     DBoolean = 45,
+    /// Standard 64-bit signed integer (`BIGINT`).
     BigInt = 52,
+    /// Auto-incrementing 64-bit integer (`BIGSERIAL`).
     BigSerial = 53,
+    /// Smart Large Character Object locator (`CLOB`).
     Clob = 101,
+    /// Smart Large Binary Object locator (`BLOB`).
     Blob = 102,
 }
 
 impl ColumnType {
+    /// Returns the canonical SQL keyword for the data type.
     pub const fn name(&self) -> &'static str {
         match self {
             Self::Char => "CHAR",
@@ -109,6 +136,7 @@ impl ColumnType {
         }
     }
 
+    /// Returns `true` if the type represents a Large Object (BYTE, TEXT, BLOB, or CLOB).
     pub const fn is_lob(&self) -> bool {
         matches!(self, Self::Byte | Self::Text | Self::Blob | Self::Clob)
     }

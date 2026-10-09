@@ -2,7 +2,10 @@
 
 use crate::result::column::ColumnInfo;
 
-/// Represents a prepared statement on the Informix server.
+/// Represents a prepared statement handle on the Informix server.
+///
+/// Contains statement metadata including statement ID, expected parameter placeholder count,
+/// and output column schemas (if the statement is a query).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedStatement {
     pub(crate) stmt_id: u16,
@@ -12,6 +15,7 @@ pub struct PreparedStatement {
 }
 
 impl PreparedStatement {
+    /// Creates a new `PreparedStatement` instance.
     pub fn new(
         stmt_id: u16,
         statement_type: u16,
@@ -26,18 +30,22 @@ impl PreparedStatement {
         }
     }
 
+    /// Returns the internal server statement identifier (`SQ_ID`).
     pub fn id(&self) -> u16 {
         self.stmt_id
     }
 
+    /// Returns the number of parameter placeholders (`?`) expected by this statement.
     pub fn parameter_count(&self) -> usize {
         self.parameter_count
     }
 
+    /// Returns the list of output column descriptors for query statements.
     pub fn columns(&self) -> &[ColumnInfo] {
         &self.columns
     }
 
+    /// Returns `true` if the statement produces result rows (e.g. `SELECT`).
     pub fn is_query(&self) -> bool {
         !self.columns.is_empty()
     }

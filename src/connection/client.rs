@@ -87,6 +87,12 @@ pub fn is_cost_follow_opcode(v: u16) -> bool {
     )
 }
 
+/// Represents an active, asynchronous connection to an IBM Informix Dynamic Server.
+///
+/// `Connection` manages the low-level TCP/TLS stream, protocol handshake, statement preparation,
+/// query execution, transaction states, and Smart-LOB descriptors.
+///
+/// All socket I/O is asynchronous and non-blocking using Tokio.
 pub struct Connection {
     stream: SqliStream,
     params: ConnectParams,
@@ -96,19 +102,32 @@ pub struct Connection {
     autocommit: bool,
 }
 
+/// Transaction isolation levels supported by Informix engines.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IsolationLevel {
+    /// Committed Read (dirty reads not allowed, reads committed data only).
     CommittedRead = 0,
+    /// Repeatable Read (re-reading rows within a transaction yields identical results).
     RepeatableRead = 1,
+    /// Serializable isolation level.
     Serializable = 3,
+    /// Cursor Stability (shared lock held on the current row of an active cursor).
     CursorStability = 4,
 }
 
 impl Connection {
+    /// Establishes an asynchronous connection to the Informix engine using the supplied parameters.
+    ///
+    /// Performs the initial three-way handshake:
+    /// 1. Sends an SL-framed `CONREQ` session request (`SL_HEADER`).
+    /// 2. Validates server acceptance (`SL_TYPE_CONACC`).
+    /// 3. Negotiates protocols and server capabilities via `SQ_PROTOCOLS`.
+    /// 4. Opens the target database (`SQ_DBOPEN`) and authenticates credentials.
     pub async fn connect(params: ConnectParams) -> Result<Self> {
         let port: u16 = params.service.parse().map_err(|_| {
             Error::InvalidArgument(format!("Invalid port or service: {}", params.service))
         })?;
+
 
         debug!("Connecting to {}:{}", params.hostname, port);
         let mut stream = SqliStream::connect(&params.hostname, port).await?;
@@ -269,14 +288,17 @@ impl Connection {
         })
     }
 
+    /// Returns the negotiated server capabilities for this connection session.
     pub fn capabilities(&self) -> &ServerCapabilities {
         &self.capabilities
     }
 
+    /// Returns the current connection state.
     pub fn state(&self) -> ConnectionState {
         self.state
     }
 
+    /// Returns a reference to the parameters used to establish this connection.
     pub fn params(&self) -> &ConnectParams {
         &self.params
     }
@@ -605,6 +627,13 @@ impl Connection {
     }
 
     /// Prepares an SQL statement on the server.
+    ///
+    /// Sends `SQ_PREPARE` along with parameter placeholder count, query string,
+    /// `SQ_NDESCRIBE`, and `SQ_WANTDONE`. The returned [`PreparedStatement`] contains
+    /// metadata about the statement (ID, parameter count, and output column descriptors).
+    ///
+    /// # Errors
+    /// Returns [`Error::Server`] if syntax error, missing table, or permission denied occurs.
     pub async fn prepare(&mut self, sql: &str) -> Result<PreparedStatement> {
         self.drain_pending_turns().await?;
 
@@ -643,7 +672,21 @@ impl Connection {
         ))
     }
 
-    /// Executes a non-query DDL/DML statement and returns affected rows.
+    /// Executes a non-query DDL or DML statement (INSERT, UPDATE, DELETE, CREATE, DROP, etc.)
+    /// and returns the number of affected rows.
+    ///
+    /// Automatically prepares the statement, executes it via `SQ_EXECUTE`, reads the
+    /// resulting `SQ_DONE` message for rows affected, and frees the statement on the server.
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use sqlicon_rs::Connection;
+    /// # async fn run(conn: &mut Connection) -> Result<(), Box<dyn std::error::Error>> {
+    /// let affected = conn.execute("UPDATE customers SET status = 'ACTIVE' WHERE balance > 0").await?;
+    /// println!("Updated {affected} rows");
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn execute(&mut self, sql: &str) -> Result<i64> {
         let stmt = self.prepare(sql).await?;
         let stmt_id = stmt.id();
@@ -663,7 +706,14 @@ impl Connection {
         Ok(turn.rows_affected)
     }
 
-    /// Executes a prepared DML/DDL statement with bound parameters.
+    /// Executes a previously prepared DML/DDL statement with bound parameters.
+    ///
+    /// Binds parameter values via `SQ_BIND` and executes the statement with `SQ_EXECUTE`.
+    /// Does not close the prepared statement, allowing it to be reused multiple times.
+    ///
+    /// # Arguments
+    /// * `stmt` - Reference to a [`PreparedStatement`] obtained from [`prepare`](Self::prepare).
+    /// * `params` - Slice of [`crate::statement::ParameterValue`] arguments to bind.
     pub async fn execute_stmt(
         &mut self,
         stmt: &PreparedStatement,
@@ -701,7 +751,10 @@ impl Connection {
         Ok(turn.rows_affected)
     }
 
-    /// Executes a prepared SELECT statement with bound parameters.
+    /// Executes a previously prepared SELECT statement with bound parameters and returns results.
+    ///
+    /// Binds parameters, opens a cursor (`SQ_OPEN`), and drains all rows using batched `SQ_NFETCH`
+    /// turns until `SQ_DONE` or EOF. Does not close the prepared statement.
     pub async fn query_stmt(
         &mut self,
         stmt: &PreparedStatement,
@@ -782,7 +835,22 @@ impl Connection {
         Ok(QueryResult::new(columns, all_rows, rows_affected, None, last_warnings))
     }
 
-    /// Executes a SELECT query and returns the complete QueryResult.
+    /// Executes a SELECT query and returns the complete [`QueryResult`].
+    ///
+    /// Prepares the query, opens a cursor, fetches all rows until exhaustion, and closes
+    /// the statement handle on the server.
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use sqlicon_rs::Connection;
+    /// # async fn run(conn: &mut Connection) -> Result<(), Box<dyn std::error::Error>> {
+    /// let res = conn.query("SELECT tabid, tabname FROM systables").await?;
+    /// for row in &res.rows {
+    ///     println!("Table: {}", row.get_str(1)?.unwrap_or_default());
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn query(&mut self, sql: &str) -> Result<QueryResult> {
         let stmt = self.prepare(sql).await?;
         let stmt_id = stmt.id();
@@ -846,6 +914,9 @@ impl Connection {
     }
 
     /// Closes and releases a statement on the server.
+    ///
+    /// Sends `SQ_ID`, `SQ_CLOSE`, and `SQ_RELEASE` packets to deallocate cursor buffers
+    /// and statement handles on the Informix engine.
     pub async fn close_statement(&mut self, stmt_id: u16) -> Result<()> {
         let mut pkt = BytesMut::with_capacity(12);
         pkt.put_u16(Opcode::Id as u16);
@@ -880,7 +951,10 @@ impl Connection {
         Ok(())
     }
 
-    /// Starts a transaction using native SQ_EOT + SQ_BEGIN (opcode 35).
+    /// Starts a transaction using native `SQ_EOT` + `SQ_BEGIN` (opcode 35).
+    ///
+    /// # Errors
+    /// Returns [`Error::InvalidState`] if a transaction is already in progress.
     pub async fn begin(&mut self) -> Result<()> {
         if self.in_transaction {
             return Err(Error::InvalidState("Transaction already in progress".into()));
@@ -899,7 +973,10 @@ impl Connection {
         Ok(())
     }
 
-    /// Commits the active transaction using native SQ_EOT + SQ_CMMTWORK (opcode 19).
+    /// Commits the active transaction using native `SQ_EOT` + `SQ_CMMTWORK` (opcode 19).
+    ///
+    /// # Errors
+    /// Returns [`Error::InvalidState`] if no transaction is active.
     pub async fn commit(&mut self) -> Result<()> {
         if !self.in_transaction {
             return Err(Error::InvalidState("No active transaction to commit".into()));
@@ -918,7 +995,10 @@ impl Connection {
         Ok(())
     }
 
-    /// Rolls back the active transaction using native SQ_EOT + SQ_RBWORK (opcode 20) + 0x0000 pad.
+    /// Rolls back the active transaction using native `SQ_EOT` + `SQ_RBWORK` (opcode 20).
+    ///
+    /// # Errors
+    /// Returns [`Error::InvalidState`] if no transaction is active.
     pub async fn rollback(&mut self) -> Result<()> {
         if !self.in_transaction {
             return Err(Error::InvalidState("No active transaction to roll back".into()));
@@ -938,7 +1018,12 @@ impl Connection {
         Ok(())
     }
 
-    /// Sets transaction isolation level.
+    /// Sets the transaction isolation level for subsequent operations.
+    ///
+    /// Corresponds to `SET ISOLATION TO ...` in Informix SQL.
+    ///
+    /// # Errors
+    /// Returns [`Error::InvalidState`] if called while inside an active transaction.
     pub async fn set_isolation_level(&mut self, level: IsolationLevel) -> Result<()> {
         if self.in_transaction {
             return Err(Error::InvalidState(
@@ -958,7 +1043,9 @@ impl Connection {
         Ok(())
     }
 
-    /// Sets lock wait behavior in seconds (negative for NOT WAIT).
+    /// Sets lock wait behavior in seconds (negative for `NOT WAIT`).
+    ///
+    /// Corresponds to `SET LOCK MODE TO WAIT [n]` or `NOT WAIT`.
     pub async fn set_lock_wait(&mut self, seconds: i32) -> Result<()> {
         let sql = if seconds < 0 {
             "set lock mode to not wait".to_string()
@@ -970,7 +1057,13 @@ impl Connection {
         Ok(())
     }
 
-    /// Creates a transaction savepoint.
+    /// Creates a transaction savepoint with the given name.
+    ///
+    /// Uses native wire opcode `SQ_SQLISETSVPT`.
+    ///
+    /// # Arguments
+    /// * `name` - Identifier for the savepoint.
+    /// * `unique` - Whether the savepoint name must be unique within the transaction.
     pub async fn savepoint_set(&mut self, name: &str, unique: bool) -> Result<()> {
         if !self.in_transaction {
             if !self.autocommit {
@@ -999,7 +1092,9 @@ impl Connection {
         Ok(())
     }
 
-    /// Releases a transaction savepoint.
+    /// Releases a transaction savepoint previously established with [`savepoint_set`](Self::savepoint_set).
+    ///
+    /// Uses native wire opcode `SQ_SQLIRELSVPT`.
     pub async fn savepoint_release(&mut self, name: &str) -> Result<()> {
         let mut pkt = BytesMut::with_capacity(16 + name.len());
         pkt.put_u16(Opcode::Sqlirelsvpt as u16);
@@ -1017,7 +1112,9 @@ impl Connection {
         Ok(())
     }
 
-    /// Rolls back to a transaction savepoint.
+    /// Rolls back changes to a transaction savepoint previously established with [`savepoint_set`](Self::savepoint_set).
+    ///
+    /// Uses native wire opcode `SQ_SQLIRBACKSVPT`.
     pub async fn savepoint_rollback(&mut self, name: &str) -> Result<()> {
         let mut pkt = BytesMut::with_capacity(16 + name.len());
         pkt.put_u16(Opcode::Sqlirbacksvpt as u16);
@@ -1035,7 +1132,7 @@ impl Connection {
         Ok(())
     }
 
-    /// Begins a batch execution block (SQ_BATCHSTART).
+    /// Begins a batch execution block using Informix `SQ_BATCHSTART` (opcode 101).
     pub async fn batch_begin(&mut self) -> Result<()> {
         let mut pkt = BytesMut::with_capacity(4);
         pkt.put_u16(Opcode::Batchstart as u16);
@@ -1044,7 +1141,7 @@ impl Connection {
         Ok(())
     }
 
-    /// Ends a batch execution block (SQ_BATCHEND).
+    /// Ends a batch execution block using Informix `SQ_BATCHEND` (opcode 102).
     pub async fn batch_end(&mut self) -> Result<()> {
         let mut pkt = BytesMut::with_capacity(4);
         pkt.put_u16(Opcode::Batchend as u16);
@@ -1054,6 +1151,23 @@ impl Connection {
     }
 
     /// Executes a batch of SQL statements sequentially, collecting results for each statement.
+    ///
+    /// Wraps execution within `batch_begin` and `batch_end` framing.
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use sqlicon_rs::Connection;
+    /// # async fn run(conn: &mut Connection) -> Result<(), Box<dyn std::error::Error>> {
+    /// let stmts = [
+    ///     "INSERT INTO t1 VALUES (1, 'A')",
+    ///     "INSERT INTO t1 VALUES (2, 'B')",
+    ///     "INSERT INTO t1 VALUES (3, 'C')",
+    /// ];
+    /// let batch_res = conn.execute_batch(&stmts).await?;
+    /// println!("Executed {} stmts ({} successful)", batch_res.len(), batch_res.success_count());
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn execute_batch(&mut self, sql_statements: &[&str]) -> Result<BatchResult> {
         self.batch_begin().await?;
 
@@ -1088,6 +1202,8 @@ impl Connection {
     }
 
     /// Executes a prepared DML statement with multiple parameter sets (parameter batching).
+    ///
+    /// Runs each row of parameters against the prepared statement, collecting individual execution outcomes.
     pub async fn execute_stmt_batch(
         &mut self,
         stmt: &PreparedStatement,
