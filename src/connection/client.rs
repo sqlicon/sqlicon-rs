@@ -526,7 +526,12 @@ impl Connection {
                     if tuple_size % 2 != 0 {
                         self.stream.drain(1).await?;
                     }
-                    turn.rows.push(Row::new(tuple_bytes.to_vec(), turn.columns.clone()));
+                    let row = Row::with_locale(
+                        tuple_bytes.to_vec(),
+                        turn.columns.clone(),
+                        Some(self.params.db_locale.clone()),
+                    );
+                    turn.rows.push(row);
                 }
                 15 => {
                     // SQ_DONE
@@ -638,7 +643,7 @@ impl Connection {
         self.drain_pending_turns().await?;
 
         let qmarks = sql.chars().filter(|&c| c == '?').count() as u16;
-        let sql_bytes = sql.as_bytes();
+        let sql_bytes = crate::types::charset::encode_string_to_db(sql, Some(&self.params.db_locale));
 
         let mut pkt = BytesMut::with_capacity(16 + sql_bytes.len());
         pkt.put_u16(Opcode::Prepare as u16); // 2
@@ -649,7 +654,7 @@ impl Connection {
         } else {
             pkt.put_u16(sql_bytes.len() as u16);
         }
-        pkt.put_slice(sql_bytes);
+        pkt.put_slice(&sql_bytes);
         if sql_bytes.len() % 2 != 0 {
             pkt.put_u8(0); // Pad
         }
@@ -729,7 +734,7 @@ impl Connection {
             bind_pkt.put_u16(Opcode::Bind as u16);
             bind_pkt.put_u16(params.len() as u16);
             for p in params {
-                p.encode_into(&mut bind_pkt);
+                p.encode_into_with_locale(&mut bind_pkt, Some(&self.params.db_locale));
             }
             bind_pkt.put_u16(Opcode::Eot as u16);
 
@@ -771,7 +776,7 @@ impl Connection {
             bind_pkt.put_u16(Opcode::Bind as u16);
             bind_pkt.put_u16(params.len() as u16);
             for p in params {
-                p.encode_into(&mut bind_pkt);
+                p.encode_into_with_locale(&mut bind_pkt, Some(&self.params.db_locale));
             }
             bind_pkt.put_u16(Opcode::Eot as u16);
 

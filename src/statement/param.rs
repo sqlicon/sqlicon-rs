@@ -42,6 +42,10 @@ impl ParameterValue {
 
 
     pub fn encode_into(&self, buf: &mut BytesMut) {
+        self.encode_into_with_locale(buf, None);
+    }
+
+    pub fn encode_into_with_locale(&self, buf: &mut BytesMut, db_locale: Option<&str>) {
         match self {
             Self::Null => {
                 buf.put_u16(0); // type 0
@@ -69,10 +73,11 @@ impl ParameterValue {
             Self::String(s) => {
                 buf.put_u16(13); // type VARCHAR
                 buf.put_u16(0);
-                let slen = s.len() as u16;
+                let encoded_bytes = crate::types::charset::encode_string_to_db(s, db_locale);
+                let slen = encoded_bytes.len() as u16;
                 buf.put_u16(slen);
                 buf.put_u16(slen);
-                buf.put_slice(s.as_bytes());
+                buf.put_slice(&encoded_bytes);
                 if (2 + slen as usize) % 2 != 0 {
                     buf.put_u8(0);
                 }

@@ -14,16 +14,30 @@ pub struct Row {
     pub(crate) tuple_data: Vec<u8>,
     pub(crate) columns: Vec<ColumnInfo>,
     pub(crate) col_offsets: Vec<usize>,
+    pub(crate) db_locale: Option<String>,
 }
 
 impl Row {
     pub fn new(tuple_data: Vec<u8>, columns: Vec<ColumnInfo>) -> Self {
+        Self::with_locale(tuple_data, columns, None)
+    }
+
+    pub fn with_locale(
+        tuple_data: Vec<u8>,
+        columns: Vec<ColumnInfo>,
+        db_locale: Option<String>,
+    ) -> Self {
         let col_offsets = Self::calculate_col_offsets(&tuple_data, &columns);
         Self {
             tuple_data,
             columns,
             col_offsets,
+            db_locale,
         }
+    }
+
+    pub fn set_db_locale(&mut self, locale: Option<String>) {
+        self.db_locale = locale;
     }
 
     fn calculate_col_offsets(tuple_data: &[u8], columns: &[ColumnInfo]) -> Vec<usize> {
@@ -319,6 +333,10 @@ impl Row {
         }
     }
 
+    /// Returns the column value as a borrowed `&str` if valid UTF-8, or None if NULL.
+    ///
+    /// For non-UTF-8 database charsets (e.g. CP1252), prefer [`get_string`](Self::get_string)
+    /// which performs full conversion into an owned UTF-8 `String`.
     pub fn get_str(&self, index: usize) -> Result<Option<&str>> {
         let raw = match self.get_raw_column(index)? {
             Some(r) => r,
@@ -329,8 +347,16 @@ impl Row {
         Ok(Some(s.trim_end()))
     }
 
+    /// Returns the column value decoded into a Rust UTF-8 `String`, automatically converting
+    /// from the server's character set (CP1252, ISO-8859-*, etc.) according to `DB_LOCALE`.
     pub fn get_string(&self, index: usize) -> Result<Option<String>> {
-        self.get_str(index).map(|opt| opt.map(|s| s.to_string()))
+        let raw = match self.get_raw_column(index)? {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+
+        let decoded = crate::types::charset::decode_wire_string(raw, self.db_locale.as_deref());
+        Ok(Some(decoded.trim_end().to_string()))
     }
 
     pub fn get_i16(&self, index: usize) -> Result<Option<i16>> {
@@ -512,10 +538,8 @@ impl Row {
 
         match col.col_type {
             ColumnType::Char | ColumnType::NChar | ColumnType::VarChar | ColumnType::NVarChar | ColumnType::LVarChar => {
-                let s = std::str::from_utf8(raw)
-                    .map(|s| s.trim_end().to_string())
-                    .unwrap_or_else(|_| String::from_utf8_lossy(raw).trim_end().to_string());
-                Ok(s)
+                let decoded = crate::types::charset::decode_wire_string(raw, self.db_locale.as_deref());
+                Ok(decoded.trim_end().to_string())
             }
             ColumnType::SmallInt => {
                 if raw.len() == 2 {

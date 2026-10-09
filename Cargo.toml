@@ -12,6 +12,7 @@ sha2 = "0.10"
 aes-gcm = "0.10"
 base64 = "0.22"
 libc = "0.2"
+encoding_rs = { version = "0.8.42", default-features = false, features = ["alloc"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_System_SystemInformation", "Win32_System_WindowsProgramming", "Win32_System_Registry"] }
