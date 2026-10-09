@@ -92,6 +92,16 @@ pub struct Connection {
     params: ConnectParams,
     capabilities: ServerCapabilities,
     state: ConnectionState,
+    in_transaction: bool,
+    autocommit: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IsolationLevel {
+    CommittedRead = 0,
+    RepeatableRead = 1,
+    Serializable = 3,
+    CursorStability = 4,
 }
 
 impl Connection {
@@ -233,6 +243,8 @@ impl Connection {
                 params: params.clone(),
                 capabilities: caps,
                 state: ConnectionState::Connecting,
+                in_transaction: false,
+                autocommit: true,
             };
 
             // First turn for DBOPEN (reads DBOPEN_FLAGS, COMMAND, DONE, COST, etc. up to EOT)
@@ -252,6 +264,8 @@ impl Connection {
             params,
             capabilities: caps,
             state: ConnectionState::Ready,
+            in_transaction: false,
+            autocommit: true,
         })
     }
 
@@ -630,6 +644,125 @@ impl Connection {
         Ok(turn.rows_affected)
     }
 
+    /// Executes a prepared DML/DDL statement with bound parameters.
+    pub async fn execute_stmt(
+        &mut self,
+        stmt: &PreparedStatement,
+        params: &[crate::statement::ParameterValue],
+    ) -> Result<i64> {
+        let stmt_id = stmt.id();
+
+        // 1. If parameters are present, send SQ_ID + SQ_BIND + paramCount + params + SQ_EOT
+        if !params.is_empty() {
+            let mut bind_pkt = BytesMut::with_capacity(32 + params.len() * 16);
+            bind_pkt.put_u16(Opcode::Id as u16);
+            bind_pkt.put_u16(stmt_id);
+            bind_pkt.put_u16(Opcode::Bind as u16);
+            bind_pkt.put_u16(params.len() as u16);
+            for p in params {
+                p.encode_into(&mut bind_pkt);
+            }
+            bind_pkt.put_u16(Opcode::Eot as u16);
+
+            self.stream.write_all(&bind_pkt).await?;
+            self.stream.flush().await?;
+        }
+
+        // 2. Send SQ_ID + SQ_EXECUTE + SQ_EOT
+        let mut exec_pkt = BytesMut::with_capacity(8);
+        exec_pkt.put_u16(Opcode::Id as u16);
+        exec_pkt.put_u16(stmt_id);
+        exec_pkt.put_u16(Opcode::Execute as u16);
+        exec_pkt.put_u16(Opcode::Eot as u16);
+
+        self.stream.write_all(&exec_pkt).await?;
+        self.stream.flush().await?;
+
+        let turn = self.dispatch_turn(TurnResult::default()).await?;
+        Ok(turn.rows_affected)
+    }
+
+    /// Executes a prepared SELECT statement with bound parameters.
+    pub async fn query_stmt(
+        &mut self,
+        stmt: &PreparedStatement,
+        params: &[crate::statement::ParameterValue],
+    ) -> Result<QueryResult> {
+        let stmt_id = stmt.id();
+        let columns = stmt.columns().to_vec();
+
+        // 1. If parameters are present, send SQ_ID + SQ_BIND + paramCount + params + SQ_EOT
+        if !params.is_empty() {
+            let mut bind_pkt = BytesMut::with_capacity(32 + params.len() * 16);
+            bind_pkt.put_u16(Opcode::Id as u16);
+            bind_pkt.put_u16(stmt_id);
+            bind_pkt.put_u16(Opcode::Bind as u16);
+            bind_pkt.put_u16(params.len() as u16);
+            for p in params {
+                p.encode_into(&mut bind_pkt);
+            }
+            bind_pkt.put_u16(Opcode::Eot as u16);
+
+            self.stream.write_all(&bind_pkt).await?;
+            self.stream.flush().await?;
+        }
+
+        // 2. Open cursor
+        let curname = b"_ifxc000000000000";
+        let mut open_pkt = BytesMut::with_capacity(32);
+        open_pkt.put_u16(Opcode::Id as u16);
+        open_pkt.put_u16(stmt_id);
+        open_pkt.put_u16(Opcode::Curname as u16);
+        open_pkt.put_u16(curname.len() as u16);
+        open_pkt.put_slice(curname);
+        if curname.len() % 2 != 0 {
+            open_pkt.put_u8(0);
+        }
+        open_pkt.put_u16(Opcode::Open as u16);
+        open_pkt.put_u16(Opcode::Eot as u16);
+
+        self.stream.write_all(&open_pkt).await?;
+        self.stream.flush().await?;
+
+        // Receive OPEN ack turn
+        let _ = self.dispatch_turn(TurnResult::default()).await?;
+
+        // 3. Fetch rows loop
+        let mut all_rows = Vec::new();
+        let rows_affected;
+        let last_warnings;
+
+        loop {
+            let prev_count = all_rows.len();
+
+            let fetch_bufsize = 32768u32;
+            let mut fetch_pkt = BytesMut::with_capacity(16);
+            fetch_pkt.put_u16(Opcode::Id as u16);
+            fetch_pkt.put_u16(stmt_id);
+            fetch_pkt.put_u16(Opcode::Nfetch as u16);
+            fetch_pkt.put_u32(fetch_bufsize);
+            fetch_pkt.put_u16(0);
+            fetch_pkt.put_u16(Opcode::Eot as u16);
+
+            self.stream.write_all(&fetch_pkt).await?;
+            self.stream.flush().await?;
+
+            let mut turn = TurnResult::default();
+            turn.columns = columns.clone();
+            turn = self.dispatch_turn(turn).await?;
+
+            all_rows.extend(turn.rows);
+
+            if all_rows.len() == prev_count || turn.saw_done {
+                rows_affected = turn.rows_affected;
+                last_warnings = turn.warnings;
+                break;
+            }
+        }
+
+        Ok(QueryResult::new(columns, all_rows, rows_affected, None, last_warnings))
+    }
+
     /// Executes a SELECT query and returns the complete QueryResult.
     pub async fn query(&mut self, sql: &str) -> Result<QueryResult> {
         let stmt = self.prepare(sql).await?;
@@ -704,6 +837,182 @@ impl Connection {
 
         self.stream.write_all(&pkt).await?;
         self.stream.flush().await?;
+        Ok(())
+    }
+
+    /// Whether the connection currently has an active transaction.
+    pub fn in_transaction(&self) -> bool {
+        self.in_transaction
+    }
+
+    /// Get current autocommit mode (default true).
+    pub fn autocommit(&self) -> bool {
+        self.autocommit
+    }
+
+    /// Set autocommit mode. Changing to true while in transaction returns InvalidState.
+    pub fn set_autocommit(&mut self, on: bool) -> Result<()> {
+        if on && !self.autocommit && self.in_transaction {
+            return Err(Error::InvalidState(
+                "commit or roll back the active transaction before enabling autocommit".into(),
+            ));
+        }
+        self.autocommit = on;
+        Ok(())
+    }
+
+    /// Starts a transaction using native SQ_EOT + SQ_BEGIN (opcode 35).
+    pub async fn begin(&mut self) -> Result<()> {
+        if self.in_transaction {
+            return Err(Error::InvalidState("Transaction already in progress".into()));
+        }
+
+        let mut pkt = BytesMut::with_capacity(4);
+        pkt.put_u16(Opcode::Eot as u16);
+        pkt.put_u16(Opcode::Begin as u16);
+
+        self.stream.write_all(&pkt).await?;
+        self.stream.flush().await?;
+
+        let _ = self.dispatch_turn(TurnResult::default()).await?;
+        self.in_transaction = true;
+        self.state = ConnectionState::InTransaction;
+        Ok(())
+    }
+
+    /// Commits the active transaction using native SQ_EOT + SQ_CMMTWORK (opcode 19).
+    pub async fn commit(&mut self) -> Result<()> {
+        if !self.in_transaction {
+            return Err(Error::InvalidState("No active transaction to commit".into()));
+        }
+
+        let mut pkt = BytesMut::with_capacity(4);
+        pkt.put_u16(Opcode::Eot as u16);
+        pkt.put_u16(Opcode::Cmmtwork as u16);
+
+        self.stream.write_all(&pkt).await?;
+        self.stream.flush().await?;
+
+        let _ = self.dispatch_turn(TurnResult::default()).await?;
+        self.in_transaction = false;
+        self.state = ConnectionState::Ready;
+        Ok(())
+    }
+
+    /// Rolls back the active transaction using native SQ_EOT + SQ_RBWORK (opcode 20) + 0x0000 pad.
+    pub async fn rollback(&mut self) -> Result<()> {
+        if !self.in_transaction {
+            return Err(Error::InvalidState("No active transaction to roll back".into()));
+        }
+
+        let mut pkt = BytesMut::with_capacity(6);
+        pkt.put_u16(Opcode::Eot as u16);
+        pkt.put_u16(Opcode::Rbwork as u16);
+        pkt.put_u16(0x0000); // 2 bytes padding required by protocol
+
+        self.stream.write_all(&pkt).await?;
+        self.stream.flush().await?;
+
+        let _ = self.dispatch_turn(TurnResult::default()).await?;
+        self.in_transaction = false;
+        self.state = ConnectionState::Ready;
+        Ok(())
+    }
+
+    /// Sets transaction isolation level.
+    pub async fn set_isolation_level(&mut self, level: IsolationLevel) -> Result<()> {
+        if self.in_transaction {
+            return Err(Error::InvalidState(
+                "Isolation level cannot be changed in active transaction".into(),
+            ));
+        }
+
+        let sql = match level {
+            IsolationLevel::CommittedRead => "set isolation to committed read",
+            IsolationLevel::RepeatableRead | IsolationLevel::Serializable => {
+                "set isolation to repeatable read"
+            }
+            IsolationLevel::CursorStability => "set isolation to cursor stability",
+        };
+
+        self.execute(sql).await?;
+        Ok(())
+    }
+
+    /// Sets lock wait behavior in seconds (negative for NOT WAIT).
+    pub async fn set_lock_wait(&mut self, seconds: i32) -> Result<()> {
+        let sql = if seconds < 0 {
+            "set lock mode to not wait".to_string()
+        } else {
+            format!("set lock mode to wait {}", seconds)
+        };
+
+        self.execute(&sql).await?;
+        Ok(())
+    }
+
+    /// Creates a transaction savepoint.
+    pub async fn savepoint_set(&mut self, name: &str, unique: bool) -> Result<()> {
+        if !self.in_transaction {
+            if !self.autocommit {
+                self.begin().await?;
+            } else {
+                return Err(Error::InvalidState(
+                    "Savepoint requires an active transaction".into(),
+                ));
+            }
+        }
+
+        let mut pkt = BytesMut::with_capacity(16 + name.len());
+        pkt.put_u16(Opcode::Sqlisetsvpt as u16);
+        pkt.put_u16(name.len() as u16);
+        pkt.put_slice(name.as_bytes());
+        if name.len() % 2 != 0 {
+            pkt.put_u8(0);
+        }
+        pkt.put_u16(if unique { 1 } else { 0 });
+        pkt.put_u16(Opcode::Eot as u16);
+
+        self.stream.write_all(&pkt).await?;
+        self.stream.flush().await?;
+
+        let _ = self.dispatch_turn(TurnResult::default()).await?;
+        Ok(())
+    }
+
+    /// Releases a transaction savepoint.
+    pub async fn savepoint_release(&mut self, name: &str) -> Result<()> {
+        let mut pkt = BytesMut::with_capacity(16 + name.len());
+        pkt.put_u16(Opcode::Sqlirelsvpt as u16);
+        pkt.put_u16(name.len() as u16);
+        pkt.put_slice(name.as_bytes());
+        if name.len() % 2 != 0 {
+            pkt.put_u8(0);
+        }
+        pkt.put_u16(Opcode::Eot as u16);
+
+        self.stream.write_all(&pkt).await?;
+        self.stream.flush().await?;
+
+        let _ = self.dispatch_turn(TurnResult::default()).await?;
+        Ok(())
+    }
+
+    /// Rolls back to a transaction savepoint.
+    pub async fn savepoint_rollback(&mut self, name: &str) -> Result<()> {
+        let mut pkt = BytesMut::with_capacity(16 + name.len());
+        pkt.put_u16(Opcode::Sqlirbacksvpt as u16);
+        pkt.put_u16(name.len() as u16);
+        pkt.put_slice(name.as_bytes());
+        if name.len() % 2 != 0 {
+            pkt.put_u8(0);
+        }
+        pkt.put_u16(Opcode::Eot as u16);
+
+        self.stream.write_all(&pkt).await?;
+        self.stream.flush().await?;
+
+        let _ = self.dispatch_turn(TurnResult::default()).await?;
         Ok(())
     }
 }

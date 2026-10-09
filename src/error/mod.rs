@@ -1,3 +1,6 @@
+pub mod catalog;
+pub use catalog::lookup_error_message;
+
 use std::fmt;
 use thiserror::Error;
 
