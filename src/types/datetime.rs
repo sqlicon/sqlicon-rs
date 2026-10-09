@@ -483,12 +483,73 @@ impl std::fmt::Display for Interval {
         if self.is_null {
             return write!(f, "NULL");
         }
-        let sign = if self.negative { "-" } else { "" };
-        write!(
-            f,
-            "{}{}-{:02} {:02}:{:02}:{:02}",
-            sign, self.days, self.hours, self.minutes, self.seconds, self.nanosecond / 1_000_000
-        )
+        if self.negative {
+            write!(f, "-")?;
+        }
+
+        let first = self.range.first as u8;
+        let last = self.range.last as u8;
+
+        for field_idx in first..=last {
+            if field_idx != first || field_idx == TemporalField::Fraction as u8 {
+                let sep = match field_idx {
+                    2 | 3 => '-', // Month, Day
+                    4 => ' ',     // Hour
+                    5 | 6 => ':', // Minute, Second
+                    _ => '.',     // Fraction
+                };
+                write!(f, "{}", sep)?;
+            }
+
+            match field_idx {
+                1 => {
+                    // Year
+                    let w = if field_idx == first { 1 } else { 2 };
+                    write!(f, "{:0width$}", self.years, width = w)?;
+                }
+                2 => {
+                    // Month
+                    let w = if field_idx == first { 1 } else { 2 };
+                    write!(f, "{:0width$}", self.months, width = w)?;
+                }
+                3 => {
+                    // Day
+                    let w = if field_idx == first { 1 } else { 2 };
+                    write!(f, "{:0width$}", self.days, width = w)?;
+                }
+                4 => {
+                    // Hour
+                    let w = if field_idx == first { 1 } else { 2 };
+                    write!(f, "{:0width$}", self.hours, width = w)?;
+                }
+                5 => {
+                    // Minute
+                    let w = if field_idx == first { 1 } else { 2 };
+                    write!(f, "{:0width$}", self.minutes, width = w)?;
+                }
+                6 => {
+                    // Second
+                    let w = if field_idx == first { 1 } else { 2 };
+                    write!(f, "{:0width$}", self.seconds, width = w)?;
+                }
+                7 => {
+                    // Fraction
+                    let width = self.range.fractional_digits as usize;
+                    let factor = match width {
+                        1 => 100_000_000,
+                        2 => 10_000_000,
+                        3 => 1_000_000,
+                        4 => 100_000,
+                        5 => 10_000,
+                        _ => 1,
+                    };
+                    let frac = self.nanosecond / factor;
+                    write!(f, "{:0width$}", frac, width = width)?;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 }
 

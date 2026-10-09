@@ -153,6 +153,14 @@ impl ProfileStore {
         }
 
         let file_path = Self::config_file()?;
+        self.save_to_path(&file_path)
+    }
+
+    pub fn save_to_path(&self, file_path: &Path) -> Result<()> {
+        if let Some(parent) = file_path.parent() {
+            fs::create_dir_all(parent).map_err(Error::Io)?;
+        }
+
         let mut out = String::new();
         out.push_str("version=2\n");
         out.push_str("kdf_method=uuid_uid_v1\n");
@@ -189,12 +197,12 @@ impl ProfileStore {
             }
         }
 
-        fs::write(&file_path, out).map_err(Error::Io)?;
+        fs::write(file_path, out).map_err(Error::Io)?;
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&file_path, fs::Permissions::from_mode(0o600));
+            let _ = fs::set_permissions(file_path, fs::Permissions::from_mode(0o600));
         }
 
         Ok(())
