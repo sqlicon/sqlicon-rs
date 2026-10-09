@@ -8,4 +8,4 @@ pub mod types;
 
 pub use error::{Error, Result, Status};
 pub use protocol::{Opcode, SlHeader};
-pub use types::ColumnType;
+pub use types::{ColumnType, Date, DateTime, Decimal, Interval};
