@@ -246,18 +246,53 @@ impl Row {
                     Err(Error::Protocol("BigInt column exceeds tuple bounds".into()))
                 }
             }
+            ColumnType::Int8 | ColumnType::Serial8 => {
+                if base + 10 <= buf.len() {
+                    // INT8 NULL sentinel: first 2 bytes are 0
+                    if buf[base] == 0 && buf[base + 1] == 0 {
+                        Ok(None)
+                    } else {
+                        Ok(Some(&buf[base..base + 10]))
+                    }
+                } else {
+                    Err(Error::Protocol("Int8 column exceeds tuple bounds".into()))
+                }
+            }
             ColumnType::Float => {
                 if base + 8 <= buf.len() {
-                    Ok(Some(&buf[base..base + 8]))
+                    // IEEE 754 null sentinel: all 8 bytes 0xFF
+                    if buf[base..base + 8].iter().all(|&b| b == 0xFF) {
+                        Ok(None)
+                    } else {
+                        Ok(Some(&buf[base..base + 8]))
+                    }
                 } else {
                     Err(Error::Protocol("Float column exceeds tuple bounds".into()))
                 }
             }
             ColumnType::SmallFloat => {
                 if base + 4 <= buf.len() {
-                    Ok(Some(&buf[base..base + 4]))
+                    // IEEE 754 null sentinel: all 4 bytes 0xFF
+                    if buf[base..base + 4].iter().all(|&b| b == 0xFF) {
+                        Ok(None)
+                    } else {
+                        Ok(Some(&buf[base..base + 4]))
+                    }
                 } else {
                     Err(Error::Protocol("SmallFloat column exceeds tuple bounds".into()))
+                }
+            }
+            ColumnType::Byte | ColumnType::Text => {
+                // Byte / Text locator descriptor: 56 bytes. Null if bit 0 of byte 39 is set
+                let len = if col.encoded_length > 0 { col.encoded_length as usize } else { 56 };
+                if base + len <= buf.len() {
+                    if len >= 40 && (buf[base + 39] & 0x01) != 0 {
+                        Ok(None)
+                    } else {
+                        Ok(Some(&buf[base..base + len]))
+                    }
+                } else {
+                    Err(Error::Protocol("Byte/Text column exceeds tuple bounds".into()))
                 }
             }
             _ => {
@@ -319,6 +354,24 @@ impl Row {
             ])))
         } else if raw.len() == 4 {
             Ok(Some(i32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]) as i64))
+        } else if raw.len() == 10 {
+            // Informix INT8 / SERIAL8: [sign: 2 bytes BE][lo32: 4 bytes BE][hi32: 4 bytes BE]
+            let sign = i16::from_be_bytes([raw[0], raw[1]]);
+            if sign == 0 {
+                return Ok(Some(0));
+            }
+            let lo = u32::from_be_bytes([raw[2], raw[3], raw[4], raw[5]]) as u64;
+            let hi = u32::from_be_bytes([raw[6], raw[7], raw[8], raw[9]]) as u64;
+            let mag = (hi << 32) | lo;
+            if sign < 0 {
+                if mag >= (i64::MAX as u64 + 1) {
+                    Ok(Some(i64::MIN))
+                } else {
+                    Ok(Some(-(mag as i64)))
+                }
+            } else {
+                Ok(Some(if mag > i64::MAX as u64 { i64::MAX } else { mag as i64 }))
+            }
         } else {
             Err(Error::TypeMismatch { expected: "i64", found: "unexpected length" })
         }
@@ -432,6 +485,18 @@ impl Row {
                     Ok((i32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]) as i64).to_string())
                 } else {
                     Ok("NULL".to_string())
+                }
+            }
+            ColumnType::Int8 | ColumnType::Serial8 => {
+                match self.get_i64(index)? {
+                    Some(v) => Ok(v.to_string()),
+                    None => Ok("NULL".to_string()),
+                }
+            }
+            ColumnType::Interval => {
+                match crate::types::datetime::interval_decode_wire(raw, col.encoded_length as u16) {
+                    Ok(iv) if !iv.is_null => Ok(iv.to_string()),
+                    _ => Ok("NULL".to_string()),
                 }
             }
             ColumnType::Float => {
