@@ -39,3 +39,28 @@ fn test_uri_invalid_cases() {
     // Missing port for onsoctcp
     assert!(ConnectParams::from_uri("informix+onsoctcp://user:pass@host/db?INFORMIXSERVER=srv").is_err());
 }
+
+#[test]
+fn test_uri_onipcstr_full() {
+    let uri = "informix+onipcstr:///customer_db?INFORMIXSERVER=ol_informix1_str";
+    let params = ConnectParams::from_uri(uri).expect("Should parse onipcstr URI");
+    assert_eq!(params.server, "ol_informix1_str");
+    assert_eq!(params.database.as_deref(), Some("customer_db"));
+    assert!(params.service.ends_with("ol_informix1_str.str") || params.service.contains("ol_informix1_str"));
+}
+
+#[test]
+fn test_uri_onipcstr_custom_socket() {
+    let uri = "informix+onipcstr:///db?INFORMIXSERVER=s&SOCKET_PATH=/var/lib/informix/socket";
+    let params = ConnectParams::from_uri(uri).expect("Should parse onipcstr custom socket");
+    assert_eq!(params.service, "/var/lib/informix/socket");
+    assert_eq!(params.server, "s");
+}
+
+#[test]
+fn test_uri_onipcstr_explicit_user() {
+    let uri = "informix+onipcstr://custom_user@/db?INFORMIXSERVER=srv1";
+    let params = ConnectParams::from_uri(uri).expect("Should parse explicit user");
+    assert_eq!(params.username, "custom_user");
+    assert_eq!(params.server, "srv1");
+}

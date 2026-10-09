@@ -170,6 +170,205 @@ pub fn build_conreq_packet(params: &ConnectParams, transport: &str) -> Result<By
     Ok(frame)
 }
 
+/// Helper to get application path for IPC preamble (Tag 0x0074).
+fn get_ipc_app_path() -> String {
+    if let Ok(p) = std::env::var("SQLI_IPC_APP_PATH") {
+        if !p.is_empty() {
+            return p;
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        "sqlicon.exe".to_string()
+    }
+    #[cfg(not(windows))]
+    {
+        let dbaccess = std::path::Path::new("/usr/lib/informix/current/bin/dbaccess");
+        if dbaccess.exists() {
+            if let Ok(canon) = dbaccess.canonicalize() {
+                return canon.to_string_lossy().to_string();
+            }
+            return "/usr/lib/informix/current/bin/dbaccess".to_string();
+        }
+        if let Ok(exe) = std::env::current_exe() {
+            return exe.to_string_lossy().to_string();
+        }
+        "sqlicon".to_string()
+    }
+}
+
+/// Builds the `onipcstr` IPC connection preamble ("sqAZ..." + Base64 payload + NUL).
+pub fn build_ipc_preamble(params: &ConnectParams) -> Result<Vec<u8>> {
+    let dl = if !params.db_locale.is_empty() {
+        &params.db_locale
+    } else {
+        "en_US.utf8"
+    };
+
+    let legacy_style = params.username != "informix";
+    let user = &params.username;
+    let version = "9.240";
+
+    // Text header
+    let prod_str = if legacy_style {
+        format!("sqlexec {user:<6} {version} serial -p -fIEEEI ")
+    } else {
+        format!("sqlexec {user:<9} {version} serial -p -fIEEEI ")
+    };
+
+    let client_locale_out = if !params.client_locale.is_empty() {
+        &params.client_locale
+    } else {
+        dl
+    };
+
+    let env_str = format!(
+        "DBPATH=//{} CLIENT_LOCALE={} NODEFDAC=no CLNT_PAM_CAPABLE=1 DB_LOCALE={} ",
+        params.server, client_locale_out, dl
+    );
+
+    let text_header = format!("{prod_str}{env_str}:");
+
+    // Binary body (before Base64)
+    let mut body = BytesMut::with_capacity(512);
+
+    // Fixed prefix (66 bytes)
+    body.put_u16(0x006D);
+    body.put_u16(0x0000);
+    body.put_u16(0x003D);
+    body.put_slice(b"on");
+    body.put_bytes(0, 8);
+
+    body.put_u16(0x003D);
+    body.put_slice(b"ipcstr");
+    body.put_bytes(0, 4);
+    body.put_u16(0x0001);
+    body.put_u16(0x0000);
+
+    body.put_u16(0x013C);
+    body.put_u16(0x0000);
+    body.put_u16(0x0000);
+
+    body.put_bytes(0, 4);
+    body.put_slice(b"sqlexec");
+    body.put_bytes(0, 5);
+
+    body.put_u16(0x0005);
+    body.put_slice(b"sqli\0");
+
+    body.put_u16(0x0006);
+    body.put_u16(0x0000);
+    body.put_u16(0x0003);
+
+    // Variable fields
+    // Server name: len(2) + name + NUL
+    let srv_bytes = params.server.as_bytes();
+    body.put_u16((srv_bytes.len() + 1) as u16);
+    body.put_slice(srv_bytes);
+    body.put_u8(0);
+
+    // Tag 0x006B: tag + zero(4) + PID(4) + zero(4)
+    body.put_u16(0x006B);
+    body.put_bytes(0, 4);
+    body.put_u32(std::process::id());
+    body.put_bytes(0, 4);
+
+    // Hostname: len(2) + name + NUL + two trailing NULs
+    let hostname = match std::env::var("HOSTNAME") {
+        Ok(h) if !h.is_empty() => h,
+        _ => {
+            #[cfg(unix)]
+            {
+                let mut buf = [0u8; 256];
+                let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+                if rc == 0 {
+                    let c_str = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr() as *const libc::c_char) };
+                    c_str.to_string_lossy().to_string()
+                } else {
+                    "localhost".to_string()
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                "localhost".to_string()
+            }
+        }
+    };
+    let host_bytes = hostname.as_bytes();
+    body.put_u16((host_bytes.len() + 1) as u16);
+    body.put_slice(host_bytes);
+    body.put_slice(&[0, 0, 0]);
+
+    // CWD: len(2) + path + NUL
+    let cwd = std::env::current_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| ".".into());
+    let cwd_bytes = cwd.as_bytes();
+    body.put_u16((cwd_bytes.len() + 1) as u16);
+    body.put_slice(cwd_bytes);
+    body.put_u8(0);
+
+    // Tag 0x006E: value = 2
+    body.put_u16(0x006E);
+    body.put_u16(0x0004);
+    body.put_u32(2);
+
+    // Tag 0x0074: container tag wrapping TID/tag info and client app path
+    let app_path = get_ipc_app_path();
+    let app_bytes = app_path.as_bytes();
+    let tag74_len = 4 + 4 + 2 + app_bytes.len() + 1;
+
+    body.put_u16(0x0074);
+    body.put_u16(tag74_len as u16);
+    body.put_u16(0x0000);
+    body.put_u16(if legacy_style { 0x03E8 } else { 0x03E7 });
+    body.put_slice(&[0, 0]);
+    if legacy_style {
+        body.put_slice(&[0x03, 0xE8]);
+    } else {
+        body.put_slice(&[0x03, 0xDD]);
+    }
+    body.put_u16((app_bytes.len() + 1) as u16);
+    body.put_slice(app_bytes);
+    body.put_u8(0);
+
+    // End marker
+    body.put_u16(0x007F);
+
+    // Base64 encode the binary body
+    let b64_body = crate::protocol::asc::encode_ipc_b64(&body);
+
+    // Compute total preamble length to construct the dynamic magic header
+    // magic header = "sq" + 8 chars Base64 = 10 bytes
+    // rest_len = length of text_header + b64_body + 1 (NUL) + 6 (magic chars 4..9)
+    // In libsqli: rest_len = p - 4, where p = 10 + text_header.len() + b64_body.len() + 1
+    let full_len = 10 + text_header.len() + b64_body.len() + 1;
+    let rest_len = full_len - 4;
+
+    let mut magic_header_bin = [0u8; 6];
+    magic_header_bin[0] = ((rest_len >> 8) & 0xFF) as u8;
+    magic_header_bin[1] = (rest_len & 0xFF) as u8;
+    magic_header_bin[2] = 0x01;
+    magic_header_bin[3] = 0x3D;
+    magic_header_bin[4] = 0x00;
+    magic_header_bin[5] = 0x00;
+
+    let magic_b64 = crate::protocol::asc::encode_ipc_b64(&magic_header_bin);
+    if magic_b64.len() != 8 {
+        return Err(Error::Protocol("Failed to encode IPC magic header".into()));
+    }
+
+    let mut preamble = Vec::with_capacity(full_len);
+    preamble.extend_from_slice(b"sq");
+    preamble.extend_from_slice(magic_b64.as_bytes());
+    preamble.extend_from_slice(text_header.as_bytes());
+    preamble.extend_from_slice(b64_body.as_bytes());
+    preamble.push(0); // NUL terminator
+
+    Ok(preamble)
+}
+
 /// Parses the ASC-BINARY body of `CONACC` or `CONREJ`.
 pub fn parse_conacc_body(body: &[u8]) -> Result<ServerCapabilities> {
     if body.len() < 4 {
@@ -353,5 +552,23 @@ mod tests {
         assert_eq!(packet[11], 0); // padding
         assert_eq!(u16::from_be_bytes([packet[12], packet[13]]), 0); // flags
         assert_eq!(u16::from_be_bytes([packet[14], packet[15]]), Opcode::Eot as u16);
+    }
+
+    #[test]
+    fn test_build_ipc_preamble() {
+        let params = ConnectParams::new("", "/tmp/test.sock", "ol_test")
+            .credentials("informix", "")
+            .locales("de_DE.1252", "de_DE.1252");
+        let pre = build_ipc_preamble(&params).expect("Should build IPC preamble");
+        assert!(pre.len() > 100);
+        assert_eq!(pre[0], b's');
+        assert_eq!(pre[1], b'q');
+        assert_eq!(pre[pre.len() - 1], 0); // NUL terminated
+
+        let s = String::from_utf8_lossy(&pre);
+        assert!(s.contains("sqlexec"));
+        assert!(s.contains("CLIENT_LOCALE=de_DE.1252"));
+        assert!(s.contains("DB_LOCALE=de_DE.1252"));
+        assert!(s.contains(':'));
     }
 }

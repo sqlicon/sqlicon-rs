@@ -123,34 +123,81 @@ impl Connection {
     /// 2. Validates server acceptance (`SL_TYPE_CONACC`).
     /// 3. Negotiates protocols and server capabilities via `SQ_PROTOCOLS`.
     /// 4. Opens the target database (`SQ_DBOPEN`) and authenticates credentials.
+    /// Establishes an asynchronous connection parsing parameters from an Informix URI.
+    pub async fn connect_uri(uri: &str) -> Result<Self> {
+        let params = ConnectParams::from_uri(uri)?;
+        Self::connect(params).await
+    }
+
     pub async fn connect(params: ConnectParams) -> Result<Self> {
-        let port: u16 = params.service.parse().map_err(|_| {
-            Error::InvalidArgument(format!("Invalid port or service: {}", params.service))
-        })?;
+        let is_unix_socket = params.service.starts_with('/');
 
+        let (mut stream, mut caps) = if is_unix_socket {
+            #[cfg(unix)]
+            {
+                debug!("Connecting to Unix socket: {}", params.service);
+                let mut stream = SqliStream::connect_unix(&params.service).await?;
+                debug!("Connected Unix socket, initiating onipcstr handshake");
 
-        debug!("Connecting to {}:{}", params.hostname, port);
-        let mut stream = SqliStream::connect(&params.hostname, port).await?;
-        debug!("Connected TCP socket, initiating SL/CONREQ handshake");
+                // Step 2a: Read 12-byte server greeting
+                let mut greeting = [0u8; 12];
+                stream.read_exact(&mut greeting).await?;
+                debug!("Received IPC greeting: {:02x?}", greeting);
 
-        // Step 1: Send SL-framed CONREQ
-        let conreq = build_conreq_packet(&params, "tlitcp")?;
-        stream.write_all(&conreq).await?;
-        stream.flush().await?;
+                // Step 2b: Send "sqAZ" IPC preamble
+                let preamble = build_ipc_preamble(&params)?;
+                debug!("Sending IPC preamble ({} bytes)", preamble.len());
+                stream.write_all(&preamble).await?;
+                stream.flush().await?;
 
-        // Step 2: Read SL response header & body
-        let (header, body) = stream.read_sl_pdu().await?;
-        debug!("Received SL response: type={}, attr={}", header.sl_type, header.sl_attr);
-
-        let mut caps = match header.sl_type {
-            SL_TYPE_CONACC => parse_conacc_body(&body)?,
-            SL_TYPE_CONREJ => {
+                // Step 2c: Read raw CONACC response: frame_len(2) + body
+                let frame_len = stream.read_u16().await? as usize;
+                if frame_len < 2 {
+                    return Err(Error::Protocol(format!(
+                        "Invalid CONACC frame length: {frame_len}"
+                    )));
+                }
+                let body_len = frame_len - 2;
+                let body = stream.read_bytes(body_len).await?;
                 let caps = parse_conacc_body(&body)?;
-                debug!("Server sent CONREJ with soft-accept, continuing");
-                caps
+                debug!("IPC CONACC accepted, cap_1={}", caps.cap_1);
+                (stream, caps)
             }
-            SL_TYPE_REDIRECT => return Err(Error::Protocol("Server returned redirect".into())),
-            other => return Err(Error::Protocol(format!("Unexpected SL type: {other}"))),
+            #[cfg(not(unix))]
+            {
+                return Err(Error::InvalidArgument(
+                    "Unix domain sockets (onipcstr) are only supported on Unix systems".into(),
+                ));
+            }
+        } else {
+            let port: u16 = params.service.parse().map_err(|_| {
+                Error::InvalidArgument(format!("Invalid port or service: {}", params.service))
+            })?;
+
+            debug!("Connecting to {}:{}", params.hostname, port);
+            let mut stream = SqliStream::connect(&params.hostname, port).await?;
+            debug!("Connected TCP socket, initiating SL/CONREQ handshake");
+
+            // Step 1: Send SL-framed CONREQ
+            let conreq = build_conreq_packet(&params, "tlitcp")?;
+            stream.write_all(&conreq).await?;
+            stream.flush().await?;
+
+            // Step 2: Read SL response header & body
+            let (header, body) = stream.read_sl_pdu().await?;
+            debug!("Received SL response: type={}, attr={}", header.sl_type, header.sl_attr);
+
+            let caps = match header.sl_type {
+                SL_TYPE_CONACC => parse_conacc_body(&body)?,
+                SL_TYPE_CONREJ => {
+                    let caps = parse_conacc_body(&body)?;
+                    debug!("Server sent CONREJ with soft-accept, continuing");
+                    caps
+                }
+                SL_TYPE_REDIRECT => return Err(Error::Protocol("Server returned redirect".into())),
+                other => return Err(Error::Protocol(format!("Unexpected SL type: {other}"))),
+            };
+            (stream, caps)
         };
 
         // Step 3: SQ_PROTOCOLS exchange

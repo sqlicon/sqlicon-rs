@@ -170,6 +170,26 @@ impl ConnectParams {
             service
         };
 
+        let username = if scheme == "informix+onipcstr" && username.is_empty() {
+            #[cfg(unix)]
+            {
+                let uid = unsafe { libc::getuid() };
+                let pw = unsafe { libc::getpwuid(uid) };
+                if !pw.is_null() {
+                    let c_str = unsafe { std::ffi::CStr::from_ptr((*pw).pw_name) };
+                    c_str.to_string_lossy().to_string()
+                } else {
+                    username
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                username
+            }
+        } else {
+            username
+        };
+
         Ok(ConnectParams {
             hostname,
             service,

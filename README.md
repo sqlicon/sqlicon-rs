@@ -14,6 +14,9 @@ A pure, asynchronous IBM Informix Dynamic Server client library and CLI written 
 ## Features
 
 - **Zero CSDK / Native Client Dependency**: Pure Rust implementation of the SQLI session, handshake, and framing layers (`SL_HEADER`, `CONREQ`, `CONACC`, `SQ_PROTOCOLS`, ASC password encryption).
+- **Multiple Transports**:
+  - **TCP Network Socket** (`onsoctcp`, `informix+onsoctcp://`)
+  - **Local Unix Domain Socket** (`onipcstr`, `informix+onipcstr://` on tmpfs/Linux with "sqAZ" IPC preamble and OS credential handshake)
 - **Asynchronous & Non-blocking**: Built on [Tokio](https://tokio.rs/) for high-throughput, non-blocking asynchronous database operations.
 - **Cross-Platform**: Tested and verified on **Linux** (x86_64) and **Windows** (x86_64).
 - **Comprehensive Informix Data Types**:
@@ -88,6 +91,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let res = conn.query("SELECT CURRENT YEAR TO SECOND FROM systables WHERE tabid = 1").await?;
     println!("Server time: {}", res.rows[0].get_display_value(0)?);
+
+    Ok(())
+}
+```
+
+### Local Connection via Unix Domain Sockets (`onipcstr`)
+
+On Linux, you can connect directly through Informix's local stream pipe socket with zero TCP stack overhead:
+
+```rust
+use sqlicon_rs::Connection;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Connects via local /INFORMIXTMP/<server>.str stream pipe socket
+    let uri = "informix+onipcstr://informix@/stores7?INFORMIXSERVER=ol_informix_str&SOCKET_PATH=/INFORMIXTMP/ol_informix.str&DB_LOCALE=de_DE.1252";
+    let mut conn = Connection::connect_uri(uri).await?;
+
+    let res = conn.query("SELECT FIRST 5 tabname FROM systables").await?;
+    for row in &res.rows {
+        println!("Table: {}", row.get_display_value(0)?);
+    }
 
     Ok(())
 }

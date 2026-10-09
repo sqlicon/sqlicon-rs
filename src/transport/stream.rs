@@ -1,4 +1,5 @@
-//! Asynchronous Tokio TCP Stream wrapper for Informix SQLI communication.
+//! Asynchronous Tokio Transport Stream wrapper for Informix SQLI communication.
+//! Supports both TCP (`onsoctcp`) and Unix domain sockets (`onipcstr`).
 
 use crate::error::{Error, Result};
 use crate::protocol::sl_header::SlHeader;
@@ -6,9 +7,17 @@ use bytes::BytesMut;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+#[cfg(unix)]
+use tokio::net::UnixStream;
+
+enum InnerStream {
+    Tcp(TcpStream),
+    #[cfg(unix)]
+    Unix(UnixStream),
+}
 
 pub struct SqliStream {
-    stream: TcpStream,
+    stream: InnerStream,
     buf: BytesMut,
 }
 
@@ -18,7 +27,16 @@ impl SqliStream {
         let stream = TcpStream::connect(&addr).await.map_err(Error::Io)?;
         let _ = stream.set_nodelay(true);
         Ok(Self {
-            stream,
+            stream: InnerStream::Tcp(stream),
+            buf: BytesMut::with_capacity(8192),
+        })
+    }
+
+    #[cfg(unix)]
+    pub async fn connect_unix<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
+        let stream = UnixStream::connect(path).await.map_err(Error::Io)?;
+        Ok(Self {
+            stream: InnerStream::Unix(stream),
             buf: BytesMut::with_capacity(8192),
         })
     }
@@ -35,7 +53,12 @@ impl SqliStream {
     pub fn try_fill_buf(&mut self) {
         let mut chunk = [0u8; 4096];
         loop {
-            match self.stream.try_read(&mut chunk) {
+            let res = match &mut self.stream {
+                InnerStream::Tcp(s) => s.try_read(&mut chunk),
+                #[cfg(unix)]
+                InnerStream::Unix(s) => s.try_read(&mut chunk),
+            };
+            match res {
                 Ok(0) => break,
                 Ok(n) => self.buf.extend_from_slice(&chunk[..n]),
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -48,7 +71,11 @@ impl SqliStream {
     pub async fn ensure_buffered(&mut self, needed: usize) -> Result<()> {
         while self.buf.len() < needed {
             let mut chunk = [0u8; 4096];
-            let n = self.stream.read(&mut chunk).await.map_err(Error::Io)?;
+            let n = match &mut self.stream {
+                InnerStream::Tcp(s) => s.read(&mut chunk).await.map_err(Error::Io)?,
+                #[cfg(unix)]
+                InnerStream::Unix(s) => s.read(&mut chunk).await.map_err(Error::Io)?,
+            };
             if n == 0 {
                 return Err(Error::Io(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
@@ -101,7 +128,11 @@ impl SqliStream {
             let fut = async {
                 while self.buf.len() < N {
                     let mut chunk = [0u8; 4096];
-                    let n = self.stream.read(&mut chunk).await?;
+                    let n = match &mut self.stream {
+                        InnerStream::Tcp(s) => s.read(&mut chunk).await?,
+                        #[cfg(unix)]
+                        InnerStream::Unix(s) => s.read(&mut chunk).await?,
+                    };
                     if n == 0 {
                         break;
                     }
@@ -126,12 +157,20 @@ impl SqliStream {
     }
 
     pub async fn write_all(&mut self, buf: &[u8]) -> Result<()> {
-        self.stream.write_all(buf).await.map_err(Error::Io)?;
+        match &mut self.stream {
+            InnerStream::Tcp(s) => s.write_all(buf).await.map_err(Error::Io)?,
+            #[cfg(unix)]
+            InnerStream::Unix(s) => s.write_all(buf).await.map_err(Error::Io)?,
+        }
         Ok(())
     }
 
     pub async fn flush(&mut self) -> Result<()> {
-        self.stream.flush().await.map_err(Error::Io)?;
+        match &mut self.stream {
+            InnerStream::Tcp(s) => s.flush().await.map_err(Error::Io)?,
+            #[cfg(unix)]
+            InnerStream::Unix(s) => s.flush().await.map_err(Error::Io)?,
+        }
         Ok(())
     }
 
@@ -161,13 +200,17 @@ impl SqliStream {
     #[cfg(unix)]
     pub fn raw_fd(&self) -> std::os::unix::io::RawFd {
         use std::os::unix::io::AsRawFd;
-        self.stream.as_raw_fd()
+        match &self.stream {
+            InnerStream::Tcp(s) => s.as_raw_fd(),
+            InnerStream::Unix(s) => s.as_raw_fd(),
+        }
     }
 
     #[cfg(windows)]
     pub fn raw_socket(&self) -> std::os::windows::io::RawSocket {
         use std::os::windows::io::AsRawSocket;
-        self.stream.as_raw_socket()
+        match &self.stream {
+            InnerStream::Tcp(s) => s.as_raw_socket(),
+        }
     }
 }
-

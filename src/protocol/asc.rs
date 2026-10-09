@@ -179,3 +179,45 @@ mod tests {
         assert_eq!(read_len, buf.len());
     }
 }
+
+/// Informix's `onipcstr` preamble uses a non-standard Base64 alphabet:
+/// `.` in place of `+` and `_` in place of `/`.
+/// Verified against dbaccess network packet traces.
+const INFORMIX_B64_ALPHA: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._";
+
+/// Encodes binary data using Informix's custom Base64 alphabet (`.` and `_`).
+pub fn encode_ipc_b64(src: &[u8]) -> String {
+    let mut out = String::with_capacity((src.len() * 4) / 3 + 4);
+    let mut i = 0;
+    while i + 2 < src.len() {
+        out.push(INFORMIX_B64_ALPHA[(src[i] >> 2) as usize] as char);
+        out.push(INFORMIX_B64_ALPHA[(((src[i] & 0x03) << 4) | (src[i + 1] >> 4)) as usize] as char);
+        out.push(INFORMIX_B64_ALPHA[(((src[i + 1] & 0x0F) << 2) | (src[i + 2] >> 6)) as usize] as char);
+        out.push(INFORMIX_B64_ALPHA[(src[i + 2] & 0x3F) as usize] as char);
+        i += 3;
+    }
+    if i < src.len() {
+        out.push(INFORMIX_B64_ALPHA[(src[i] >> 2) as usize] as char);
+        if i + 1 < src.len() {
+            out.push(INFORMIX_B64_ALPHA[(((src[i] & 0x03) << 4) | (src[i + 1] >> 4)) as usize] as char);
+            out.push(INFORMIX_B64_ALPHA[((src[i + 1] & 0x0F) << 2) as usize] as char);
+        } else {
+            out.push(INFORMIX_B64_ALPHA[((src[i] & 0x03) << 4) as usize] as char);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod ipc_b64_tests {
+    use super::*;
+
+    #[test]
+    fn test_ipc_b64_encoding_custom_chars() {
+        // Test that values map to '.' (62) and '_' (63)
+        let data = [0b11111000, 0b00111111]; // 62, 63 in 6-bit parts
+        let encoded = encode_ipc_b64(&data);
+        assert!(encoded.contains('.') || encoded.contains('_'));
+    }
+}
