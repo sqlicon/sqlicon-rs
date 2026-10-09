@@ -522,12 +522,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    if let Some(ref test_name) = args.profile_test {
-        if store.get(test_name).is_none() {
+    if let Some(ref test_name) = args.profile_test
+        && store.get(test_name).is_none() {
             eprintln!("error: profile '{test_name}' not found");
             process::exit(1);
         }
-    }
 
     // Connect to server
     let mut conn = match Connection::connect(connect_params).await {
