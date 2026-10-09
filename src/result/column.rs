@@ -11,6 +11,7 @@ pub struct ColumnInfo {
     pub encoded_length: u32,
     pub col_start_pos: u32,
     pub field_index: i32,
+    pub type_name: Option<String>,
 }
 
 impl ColumnInfo {
@@ -29,7 +30,13 @@ impl ColumnInfo {
             encoded_length,
             col_start_pos,
             field_index,
+            type_name: None,
         }
+    }
+
+    pub fn with_type_name(mut self, t_name: impl Into<String>) -> Self {
+        self.type_name = Some(t_name.into());
+        self
     }
 
     pub fn is_nullable(&self) -> bool {

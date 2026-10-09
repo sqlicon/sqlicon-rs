@@ -31,7 +31,7 @@ async fn test_live_data_types_matrix() {
         .as_secs();
     let tbl = format!("dt_matrix_{}", epoch_s % 100000);
 
-    // Create table with all Informix scalar & temporal data types
+    // Create table with all Informix scalar, temporal & Smart-LOB data types
     let ddl = format!(
         "CREATE TABLE {tbl} (
             id INT,
@@ -49,13 +49,15 @@ async fn test_live_data_types_matrix() {
             c_char CHAR(10),
             c_varchar VARCHAR(50),
             c_lvarchar LVARCHAR(255),
-            c_bool BOOLEAN
+            c_bool BOOLEAN,
+            c_blob BLOB,
+            c_clob CLOB
         )"
     );
 
     conn.execute(&ddl).await.expect("Failed to create type matrix table");
 
-    // Insert non-null row
+    // Insert non-null row (using FILETOBLOB / FILETOCLOB for valid LOB locators)
     let insert_val = format!(
         "INSERT INTO {tbl} VALUES (
             1,
@@ -73,7 +75,9 @@ async fn test_live_data_types_matrix() {
             'Informix',
             'Varchar string',
             'Long variable character test',
-            't'
+            't',
+            FILETOBLOB('/etc/hosts', 'server'),
+            FILETOCLOB('/etc/hosts', 'server')
         )"
     );
     conn.execute(&insert_val).await.expect("Failed to insert non-null row");
@@ -82,7 +86,7 @@ async fn test_live_data_types_matrix() {
     let insert_null = format!(
         "INSERT INTO {tbl} VALUES (
             2,
-            NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
+            NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
         )"
     );
     conn.execute(&insert_null).await.expect("Failed to insert null row");
@@ -131,6 +135,12 @@ async fn test_live_data_types_matrix() {
     assert_eq!(r1.get_str(14).unwrap(), Some("Long variable character test"));
     assert_eq!(r1.get_bool(15).unwrap(), Some(true));
 
+    // BLOB / CLOB: non-null locator string
+    assert!(r1.get_str(16).unwrap().is_some());
+    assert!(r1.get_str(17).unwrap().is_some());
+    assert_eq!(r1.column(16).unwrap().col_type, sqlicon_rs::ColumnType::Blob);
+    assert_eq!(r1.column(17).unwrap().col_type, sqlicon_rs::ColumnType::Clob);
+
     // Row 2: All NULLs verification
     let r2 = &result.rows[1];
     assert_eq!(r2.get_i32(0).unwrap(), Some(2));
@@ -149,6 +159,8 @@ async fn test_live_data_types_matrix() {
     assert_eq!(r2.get_str(13).unwrap(), None);
     assert_eq!(r2.get_str(14).unwrap(), None);
     assert_eq!(r2.get_bool(15).unwrap(), None);
+    assert_eq!(r2.get_str(16).unwrap(), None);
+    assert_eq!(r2.get_str(17).unwrap(), None);
 
     // Verify display representation
     assert_eq!(r2.get_display_value(1).unwrap(), "NULL");
@@ -157,6 +169,8 @@ async fn test_live_data_types_matrix() {
     assert_eq!(r2.get_display_value(10).unwrap(), "NULL");
     assert_eq!(r2.get_display_value(11).unwrap(), "NULL");
     assert_eq!(r2.get_display_value(15).unwrap(), "NULL");
+    assert_eq!(r2.get_display_value(16).unwrap(), "NULL");
+    assert_eq!(r2.get_display_value(17).unwrap(), "NULL");
 
     // Cleanup
     let drop_ddl = format!("DROP TABLE {tbl}");

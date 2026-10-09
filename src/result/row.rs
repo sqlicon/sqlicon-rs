@@ -591,6 +591,27 @@ impl Row {
                     _ => Ok("NULL".to_string()),
                 }
             }
+            ColumnType::Blob | ColumnType::Clob => {
+                // Smart LOB locator: already ASCII text string in wire representation
+                if let Ok(s) = std::str::from_utf8(raw) {
+                    Ok(s.trim_end().to_string())
+                } else {
+                    let mut hex = String::with_capacity(raw.len() * 2);
+                    for &b in raw {
+                        use std::fmt::Write;
+                        let _ = write!(hex, "{:02x}", b);
+                    }
+                    Ok(hex)
+                }
+            }
+            ColumnType::Byte => {
+                let mut hex = String::with_capacity(raw.len() * 2);
+                for &b in raw {
+                    use std::fmt::Write;
+                    let _ = write!(hex, "{:02x}", b);
+                }
+                Ok(hex)
+            }
             _ => {
                 Ok(String::from_utf8_lossy(raw).trim_end().to_string())
             }

@@ -377,23 +377,30 @@ impl Connection {
                         let tuple_offset = self.stream.read_u32().await?;
                         let type_raw = self.stream.read_u16().await?;
 
-                        let encoded_len = if !self.capabilities.extended_describe {
-                            self.stream.read_u16().await? as u32
+                        let (encoded_len, extended_type, type_name) = if !self.capabilities.extended_describe {
+                            let len = self.stream.read_u16().await? as u32;
+                            (len, None, None)
                         } else {
-                            let _extended_info = self.stream.read_u32().await?;
+                            let extended_info = self.stream.read_u32().await?;
                             let o_len = self.stream.read_u16().await? as usize;
                             if o_len > 0 { self.stream.drain(o_len).await?; }
                             if o_len % 2 != 0 { self.stream.drain(1).await?; }
                             let n_len = self.stream.read_u16().await? as usize;
-                            if n_len > 0 { self.stream.drain(n_len).await?; }
+                            let t_name = if n_len > 0 {
+                                let bytes = self.stream.read_bytes(n_len).await?;
+                                Some(String::from_utf8_lossy(&bytes).to_string())
+                            } else {
+                                None
+                            };
                             if n_len % 2 != 0 { self.stream.drain(1).await?; }
                             let _reference = self.stream.read_u16().await?;
                             let _alignment = self.stream.read_u16().await?;
                             let _source_type = self.stream.read_u32().await?;
-                            self.stream.read_u32().await?
+                            let len = self.stream.read_u32().await?;
+                            (len, Some(extended_info), t_name)
                         };
 
-                        fields_meta.push((field_idx, tuple_offset, type_raw, encoded_len));
+                        fields_meta.push((field_idx, tuple_offset, type_raw, encoded_len, extended_type, type_name));
                     }
 
                     let names_buf = if names_length > 0 {
@@ -407,7 +414,7 @@ impl Connection {
 
                     turn.columns.clear();
                     let mut name_offset = 0;
-                    for (field_idx, tuple_offset, type_raw, encoded_len) in fields_meta {
+                    for (field_idx, tuple_offset, type_raw, encoded_len, extended_type, type_name) in fields_meta {
                         let col_name = if name_offset < names_buf.len() {
                             let start = name_offset;
                             let end = names_buf[start..]
@@ -422,15 +429,27 @@ impl Connection {
                             format!("col_{field_idx}")
                         };
 
-                        let col_type = ColumnType::from_raw(type_raw).unwrap_or(ColumnType::Char);
-                        turn.columns.push(ColumnInfo::new(
+                        // Map extended types (e.g. extended_info 10 = BLOB, 11 = CLOB, 1 = LVARCHAR, 5 = BOOL)
+                        let col_type = match extended_type {
+                            Some(10) => ColumnType::Blob,
+                            Some(11) => ColumnType::Clob,
+                            Some(1) => ColumnType::LVarChar,
+                            Some(5) => ColumnType::Bool,
+                            _ => ColumnType::from_raw(type_raw).unwrap_or(ColumnType::Char),
+                        };
+
+                        let mut col_info = ColumnInfo::new(
                             col_name,
                             col_type,
                             type_raw,
                             encoded_len,
                             tuple_offset,
                             field_idx,
-                        ));
+                        );
+                        if let Some(tn) = type_name {
+                            col_info = col_info.with_type_name(tn);
+                        }
+                        turn.columns.push(col_info);
                     }
                 }
                 10 | 11 => {
