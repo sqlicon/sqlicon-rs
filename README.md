@@ -1,0 +1,278 @@
+# sqlicon-rs
+
+[![Crates.io](https://img.shields.io/badge/crates.io-v0.1.0-orange.svg)](https://crates.io)
+[![Documentation](https://docs.rs/sqlicon-rs/badge.svg)](https://docs.rs/sqlicon-rs)
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](Cargo.toml)
+[![Rust](https://img.shields.io/badge/rust-2024%20edition-purple.svg)](Cargo.toml)
+
+A pure, asynchronous IBM Informix Dynamic Server client library and CLI written in 100% safe, idiomatic Rust.
+
+`sqlicon-rs` implements the native Informix **SQLI wire protocol** (`onsoctcp`) directly over non-blocking TCP (`tokio`). It requires **zero native CSDK dependencies**, no IBM Informix Client-SDK installation, and runs seamlessly on both **Linux** and **Windows**.
+
+---
+
+## Features
+
+- **Zero CSDK / Native Client Dependency**: Pure Rust implementation of the SQLI session, handshake, and framing layers (`SL_HEADER`, `CONREQ`, `CONACC`, `SQ_PROTOCOLS`, ASC password encryption).
+- **Asynchronous & Non-blocking**: Built on [Tokio](https://tokio.rs/) for high-throughput, non-blocking asynchronous database operations.
+- **Cross-Platform**: Tested and verified on **Linux** (x86_64) and **Windows** (x86_64).
+- **Comprehensive Informix Data Types**:
+  - **Numeric**: `SMALLINT`, `INTEGER`, `BIGINT`, `INT8`, `SERIAL`, `SERIAL8`, `BIGSERIAL`, `FLOAT`, `SMALLFLOAT`, `DECIMAL`, `MONEY`.
+  - **Temporal**: `DATE`, `DATETIME` (all qualifiers up to `YEAR TO FRACTION(5)`), `INTERVAL`.
+  - **Text & Character**: `CHAR`, `VARCHAR`, `LVARCHAR`, `NCHAR`, `NVARCHAR`, `BOOLEAN`.
+  - **Smart Large Objects (SLOB)**: Complete `BLOB` and `CLOB` support with random-access seeking, chunked reading, and streaming writes (`SQ_LODATA`).
+- **Full Database Charset & GLS Support**: Automatic conversion between database encoding (`DB_LOCALE` such as `de_DE.1252` / Windows-1252, ISO-8859-1..15, Shift-JIS, GB2312, Big5, etc.) and Rust UTF-8 `String`s.
+- **Prepared Statements & Parameter Binding**: Fast binary parameter encoding (`?` placeholders) and batched execution.
+- **Transactions & Savepoints**: ANSI and Informix transactions (`begin`, `commit`, `rollback`), named savepoints (`savepoint_set`, `savepoint_release`, `savepoint_rollback`), and isolation levels (`CommittedRead`, `RepeatableRead`, `Serializable`, `CursorStability`).
+- **Out-of-Band TCP Cancellation**: Non-blocking `CancelHandle` using TCP urgent out-of-band interrupts (`MSG_OOB` via POSIX `send` on Unix and Winsock `send` on Windows) to abort long-running queries (`SQLCODE -213`).
+- **Offline Error Catalog**: Full embedded 3,412-error Informix message catalog with dictionary expansion matching IBM Informix `finderr`.
+- **Encrypted Profile Store**: Built-in CLI profile manager with AES-256-GCM encryption tied to machine-specific hardware IDs (`/etc/machine-id` on Linux, `MachineGuid` on Windows).
+
+---
+
+## Installation
+
+Add `sqlicon-rs` to your `Cargo.toml`:
+
+```toml
+[dependencies]
+sqlicon-rs = "0.1.0"
+tokio = { version = "1", features = ["full"] }
+```
+
+---
+
+## Quick Start
+
+### Basic Query Execution
+
+```rust
+use sqlicon_rs::{ConnectParams, Connection};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Configure connection parameters
+    let params = ConnectParams::new("127.0.0.1", "9089", "ol_iep")
+        .database("stores7")
+        .credentials("informix", "secret_password")
+        .locales("de_DE.1252", "de_DE.1252");
+
+    // Connect to Informix engine
+    let mut conn = Connection::connect(params).await?;
+
+    // Execute query
+    let result = conn.query("SELECT customer_num, fname, lname, balance FROM customer").await?;
+
+    for row in &result.rows {
+        let id = row.get_display_value(0)?;
+        let first_name = row.get_display_value(1)?;
+        let last_name = row.get_display_value(2)?;
+        println!("Customer #{id}: {first_name} {last_name}");
+    }
+
+    Ok(())
+}
+```
+
+### Connection via URI
+
+You can also connect using an Informix URI:
+
+```rust
+use sqlicon_rs::Connection;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let uri = "informix+onsoctcp://informix:secret@127.0.0.1:9089/stores7?INFORMIXSERVER=ol_iep&DB_LOCALE=de_DE.1252";
+    let mut conn = Connection::connect_uri(uri).await?;
+
+    let res = conn.query("SELECT CURRENT YEAR TO SECOND FROM systables WHERE tabid = 1").await?;
+    println!("Server time: {}", res.rows[0].get_display_value(0)?);
+
+    Ok(())
+}
+```
+
+### Prepared Statements & Parameter Binding
+
+```rust
+use sqlicon_rs::{Connection, ParameterValue};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut conn = Connection::connect_uri("informix+onsoctcp://informix:secret@127.0.0.1:9089/stores7?INFORMIXSERVER=ol_iep").await?;
+
+    // Prepare statement with placeholders
+    let mut stmt = conn.prepare("SELECT customer_num, fname FROM customer WHERE customer_num = ? AND active = ?").await?;
+
+    // Bind parameters and execute
+    let params = vec![
+        ParameterValue::Integer(101),
+        ParameterValue::Boolean(true),
+    ];
+    let result = conn.execute_prepared(&mut stmt, &params).await?;
+
+    for row in &result.rows {
+        println!("Found: {} - {}", row.get_display_value(0)?, row.get_display_value(1)?);
+    }
+
+    Ok(())
+}
+```
+
+### Transactions and Savepoints
+
+```rust
+use sqlicon_rs::{Connection, IsolationLevel};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut conn = Connection::connect_uri("informix+onsoctcp://informix:secret@127.0.0.1:9089/stores7?INFORMIXSERVER=ol_iep").await?;
+
+    conn.set_isolation(IsolationLevel::CommittedRead).await?;
+    conn.begin().await?;
+
+    conn.execute("UPDATE account SET balance = balance - 100 WHERE id = 1").await?;
+    
+    // Set a named savepoint
+    conn.savepoint_set("sp1").await?;
+    
+    match conn.execute("UPDATE account SET balance = balance + 100 WHERE id = 2").await {
+        Ok(_) => {
+            conn.savepoint_release("sp1").await?;
+            conn.commit().await?;
+            println!("Transaction committed successfully.");
+        }
+        Err(e) => {
+            eprintln!("Error encountered, rolling back to savepoint: {e}");
+            conn.savepoint_rollback("sp1").await?;
+            conn.rollback().await?;
+        }
+    }
+
+    Ok(())
+}
+```
+
+### Out-of-Band Query Cancellation
+
+Long-running queries can be safely aborted from another Tokio task or thread using `CancelHandle`:
+
+```rust
+use std::time::Duration;
+use sqlicon_rs::Connection;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut conn = Connection::connect_uri("informix+onsoctcp://informix:secret@127.0.0.1:9089/stores7?INFORMIXSERVER=ol_iep").await?;
+
+    // Obtain a Send + Sync + Clone handle
+    let cancel_handle = conn.cancel_handle();
+
+    // Spawn a worker to cancel query after 1 second
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        println!("Sending out-of-band cancellation interrupt...");
+        cancel_handle.cancel().expect("Failed to send OOB cancel");
+    });
+
+    // Run long-running query
+    match conn.query("SELECT count(*) FROM huge_table, huge_table").await {
+        Ok(_) => println!("Query completed."),
+        Err(e) => println!("Query cancelled as expected: {e}"), // SQLCODE -213
+    }
+
+    Ok(())
+}
+```
+
+---
+
+## CLI Usage
+
+`sqlicon-rs` includes an interactive CLI client for testing, administration, and querying Informix databases.
+
+### Running Queries
+
+```bash
+cargo run -- -h 127.0.0.1 -p 9089 -s ol_iep -d stores7 -u informix -w secret -c "SELECT FIRST 10 tabname FROM systables"
+```
+
+### Profile Management
+
+Credentials can be stored encrypted with hardware-bound keys:
+
+```bash
+# Save profile
+cargo run -- profile add prod --host 10.0.0.5 --port 9089 --server ol_prod --database erp --user informix
+
+# Connect using profile
+cargo run -- -P prod -c "SELECT count(*) FROM orders"
+```
+
+---
+
+## Architecture & Protocols
+
+```
++-------------------------------------------------------------+
+|                     User Application                        |
++-------------------------------------------------------------+
+                              |
++-------------------------------------------------------------+
+|                 sqlicon-rs High-Level API                   |
+|   (Connection, PreparedStatement, QueryResult, Row, etc.)   |
++-------------------------------------------------------------+
+         |                                           |
++--------------------+                     +------------------+
+|   Types & Codesets |                     | CancelHandle     |
+| (encoding_rs GLS)  |                     | (TCP MSG_OOB)    |
++--------------------+                     +------------------+
+         |                                           |
++-------------------------------------------------------------+
+|                 SQLI Wire Protocol Engine                   |
+|   (Handshake, Session framing, SQ_PROTOCOLS, ASC auth)     |
++-------------------------------------------------------------+
+                              |
++-------------------------------------------------------------+
+|                     Tokio Async TCP                         |
++-------------------------------------------------------------+
+                              |
+                      [ Informix Engine ]
+```
+
+---
+
+## Testing
+
+### Unit Tests
+
+```bash
+cargo test --lib
+```
+
+### Integration Tests with Live Engine
+
+To run integration tests against a live Informix instance:
+
+```bash
+export INFORMIX_HOST="127.0.0.1"
+export INFORMIX_PORT="9089"
+export INFORMIX_SERVER="ol_iep"
+export INFORMIX_DB="stores7"
+export INFORMIX_USER="informix"
+export INFORMIX_PASS="secret"
+
+cargo test --test live_test
+```
+
+---
+
+## License
+
+This project is licensed under either of:
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
+
+at your option.
