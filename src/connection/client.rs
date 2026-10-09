@@ -1034,4 +1034,497 @@ impl Connection {
         let _ = self.dispatch_turn(TurnResult::default()).await?;
         Ok(())
     }
+
+    /// Begins a batch execution block (SQ_BATCHSTART).
+    pub async fn batch_begin(&mut self) -> Result<()> {
+        let mut pkt = BytesMut::with_capacity(4);
+        pkt.put_u16(Opcode::Batchstart as u16);
+        self.stream.write_all(&pkt).await?;
+        self.stream.flush().await?;
+        Ok(())
+    }
+
+    /// Ends a batch execution block (SQ_BATCHEND).
+    pub async fn batch_end(&mut self) -> Result<()> {
+        let mut pkt = BytesMut::with_capacity(4);
+        pkt.put_u16(Opcode::Batchend as u16);
+        self.stream.write_all(&pkt).await?;
+        self.stream.flush().await?;
+        Ok(())
+    }
+
+    /// Executes a batch of SQL statements sequentially, collecting results for each statement.
+    pub async fn execute_batch(&mut self, sql_statements: &[&str]) -> Result<BatchResult> {
+        self.batch_begin().await?;
+
+        let mut items = Vec::with_capacity(sql_statements.len());
+        for &sql in sql_statements {
+            if sql.trim().is_empty() {
+                items.push(BatchItemResult {
+                    status: Ok(()),
+                    rows_affected: 0,
+                });
+                continue;
+            }
+
+            match self.execute(sql).await {
+                Ok(affected) => {
+                    items.push(BatchItemResult {
+                        status: Ok(()),
+                        rows_affected: affected,
+                    });
+                }
+                Err(e) => {
+                    items.push(BatchItemResult {
+                        status: Err(e),
+                        rows_affected: 0,
+                    });
+                }
+            }
+        }
+
+        self.batch_end().await?;
+        Ok(BatchResult { items })
+    }
+
+    /// Executes a prepared DML statement with multiple parameter sets (parameter batching).
+    pub async fn execute_stmt_batch(
+        &mut self,
+        stmt: &PreparedStatement,
+        param_rows: &[Vec<crate::statement::ParameterValue>],
+    ) -> Result<BatchResult> {
+        let mut items = Vec::with_capacity(param_rows.len());
+        for params in param_rows {
+            match self.execute_stmt(stmt, params).await {
+                Ok(affected) => {
+                    items.push(BatchItemResult {
+                        status: Ok(()),
+                        rows_affected: affected,
+                    });
+                }
+                Err(e) => {
+                    items.push(BatchItemResult {
+                        status: Err(e),
+                        rows_affected: 0,
+                    });
+                }
+            }
+        }
+        Ok(BatchResult { items })
+    }
+
+    /// Returns a cancellation handle that can asynchronously interrupt in-flight execution on this connection.
+    pub fn cancel_handle(&self) -> CancelHandle {
+        #[cfg(unix)]
+        {
+            CancelHandle {
+                fd: self.stream.raw_fd(),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            CancelHandle {}
+        }
+    }
+
+    /// Opens a Smart Large Object (BLOB / CLOB) by hexadecimal locator string.
+    ///
+    /// Mode values:
+    /// - 1: Append
+    /// - 2: Write-only
+    /// - 4: Read-only
+    /// - 8: Read/Write
+    pub async fn sblob_open(&mut self, locator_hex: &str, mode: i32) -> Result<i32> {
+        let sql = format!("SELECT ifx_lo_open('{locator_hex}'::BLOB, {mode}) FROM sysmaster:sysdual");
+        let res = self.query(&sql).await?;
+        if res.rows.is_empty() {
+            return Err(Error::Server {
+                sqlcode: -1,
+                isamcode: 0,
+                sqlstate: "".to_string(),
+                message: "smartblob open query returned no rows".to_string(),
+            });
+        }
+        let lofd_val: i32 = res.rows[0].get_i32(0)?.ok_or_else(|| Error::Protocol(
+            "smartblob open query returned NULL handle".to_string(),
+        ))?;
+        if lofd_val < 0 {
+            return Err(Error::Protocol("invalid smartblob handle returned by server".to_string()));
+        }
+        Ok(lofd_val)
+    }
+
+    /// Closes an open Smart Large Object descriptor handle.
+    pub async fn sblob_close(&mut self, lofd: i32) -> Result<()> {
+        let sql = format!("SELECT ifx_lo_close({lofd}) FROM sysmaster:sysdual");
+        let _ = self.query(&sql).await?;
+        Ok(())
+    }
+
+    /// Reads up to `max_bytes` from an open Smart Large Object descriptor using SQ_LODATA (subCom = 0).
+    pub async fn sblob_read(&mut self, lofd: i32, max_bytes: usize) -> Result<Vec<u8>> {
+        if max_bytes == 0 {
+            return Ok(Vec::new());
+        }
+
+        let lofd_u16 = lofd as u16;
+        let req_len = (max_bytes.min(0x7FFF_FFFF)) as i32;
+
+        let mut req = BytesMut::with_capacity(14);
+        req.put_u16(Opcode::Lodata as u16);
+        req.put_u16(0); // subCom = 0 (LO_READ)
+        req.put_u16(lofd_u16);
+        req.put_i32(req_len);
+        req.put_u16(32000); // bufferSize = 32000
+        req.put_u16(Opcode::Eot as u16);
+
+        self.stream.write_all(&req).await?;
+        self.stream.flush().await?;
+
+        // Read response header: skip any EOTs until opcode
+        let resp_op = loop {
+            let op = self.stream.read_u16().await?;
+            if op != Opcode::Eot as u16 {
+                break op;
+            }
+        };
+
+
+        if resp_op == Opcode::Err as u16 {
+            // Drain error
+            let sqlcode = self.stream.read_u16().await? as i16;
+            let isamcode = self.stream.read_u16().await? as i16;
+            self.stream.drain(if self.capabilities.remove_64k_limit { 4 } else { 2 }).await?;
+            let msg = self.read_str().await?;
+            return Err(Error::Server {
+                sqlcode: sqlcode as i32,
+                isamcode: isamcode as i32,
+                sqlstate: "".to_string(),
+                message: msg,
+            });
+        }
+
+        if resp_op != Opcode::Lodata as u16 {
+            return Err(Error::Protocol(format!(
+                "Unexpected opcode in SQ_LODATA read response: {resp_op}"
+            )));
+        }
+
+        // Response body: optype(2), file_size(4)
+        let _optype = self.stream.read_u16().await?;
+        let file_size = self.stream.read_u32().await? as usize;
+
+        if file_size == 0 {
+            // Drain trailing SQ_DONE / SQ_EOT
+            self.drain_sblob_trailing().await?;
+            return Ok(Vec::new());
+        }
+
+        let stream_expected = file_size.min(max_bytes);
+        let mut total_streamed = 0usize;
+        let mut result_data = Vec::with_capacity(stream_expected);
+
+        while total_streamed < stream_expected {
+            let chlen = self.stream.read_u16().await? as usize;
+            if chlen == 0 {
+                break;
+            }
+
+            let to_read = chlen.min(max_bytes.saturating_sub(result_data.len()));
+            if to_read > 0 {
+                let chunk = self.stream.read_bytes(to_read).await?;
+                result_data.extend_from_slice(&chunk);
+            }
+            if chlen > to_read {
+                let discard = chlen - to_read;
+                self.stream.drain(discard).await?;
+            }
+
+            if chlen % 2 != 0 {
+                self.stream.drain(1).await?;
+            }
+
+            total_streamed += chlen;
+        }
+
+        self.drain_sblob_trailing().await?;
+        Ok(result_data)
+    }
+
+    /// Reads with relative seek displacement from an open Smart Large Object using SQ_LODATA (subCom = 1).
+    pub async fn sblob_read_seek(
+        &mut self,
+        lofd: i32,
+        offset: i64,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>> {
+        if max_bytes == 0 {
+            return Ok(Vec::new());
+        }
+
+        let lofd_u16 = lofd as u16;
+        let req_len = (max_bytes.min(0x7FFF_FFFF)) as i32;
+
+        let sign: u16 = if offset < 0 { u16::MAX } else { 1 };
+        let mag: u64 = if offset < 0 {
+            (-(offset + 1)) as u64 + 1
+        } else {
+            offset as u64
+        };
+        let low32 = (mag & 0xFFFF_FFFF) as u32;
+        let high32 = (mag >> 32) as u32;
+
+        let mut req = BytesMut::with_capacity(26);
+        req.put_u16(Opcode::Lodata as u16);
+        req.put_u16(1); // subCom = 1 (LO_READWITHSEEK)
+        req.put_u16(lofd_u16);
+        req.put_i32(req_len);
+        req.put_u16(32000); // bufferSize = 32000
+        req.put_u16(sign);
+        req.put_u32(low32);
+        req.put_u32(high32);
+        req.put_u16(1); // whence = 1 (LO_SEEK_CUR)
+        req.put_u16(Opcode::Eot as u16);
+
+        self.stream.write_all(&req).await?;
+        self.stream.flush().await?;
+
+        let resp_op = loop {
+            let op = self.stream.read_u16().await?;
+            if op != Opcode::Eot as u16 {
+                break op;
+            }
+        };
+
+        if resp_op == Opcode::Err as u16 {
+            let sqlcode = self.stream.read_u16().await? as i16;
+            let isamcode = self.stream.read_u16().await? as i16;
+            self.stream.drain(if self.capabilities.remove_64k_limit { 4 } else { 2 }).await?;
+            let msg = self.read_str().await?;
+            return Err(Error::Server {
+                sqlcode: sqlcode as i32,
+                isamcode: isamcode as i32,
+                sqlstate: "".to_string(),
+                message: msg,
+            });
+        }
+
+        if resp_op != Opcode::Lodata as u16 {
+            return Err(Error::Protocol(format!(
+                "Unexpected opcode in SQ_LODATA seek response: {resp_op}"
+            )));
+        }
+
+        let _optype = self.stream.read_u16().await?;
+        let remaining_size = self.stream.read_u32().await? as usize;
+
+        if remaining_size == 0 {
+            self.drain_sblob_trailing().await?;
+            return Ok(Vec::new());
+        }
+
+        let stream_expected = remaining_size.min(max_bytes);
+        let mut total_streamed = 0usize;
+        let mut result_data = Vec::with_capacity(stream_expected);
+
+        while total_streamed < stream_expected {
+            let chlen = self.stream.read_u16().await? as usize;
+            if chlen == 0 {
+                break;
+            }
+
+            let to_read = chlen.min(max_bytes.saturating_sub(result_data.len()));
+            if to_read > 0 {
+                let chunk = self.stream.read_bytes(to_read).await?;
+                result_data.extend_from_slice(&chunk);
+            }
+            if chlen > to_read {
+                let discard = chlen - to_read;
+                self.stream.drain(discard).await?;
+            }
+
+            if chlen % 2 != 0 {
+                self.stream.drain(1).await?;
+            }
+
+            total_streamed += chlen;
+        }
+
+        self.drain_sblob_trailing().await?;
+        Ok(result_data)
+    }
+
+    /// Writes data to an open Smart Large Object using SQ_LODATA (subCom = 2).
+    pub async fn sblob_write(&mut self, lofd: i32, data: &[u8]) -> Result<usize> {
+        if data.is_empty() {
+            return Ok(0);
+        }
+
+        let lofd_u16 = lofd as u16;
+        let req_len = data.len().min(0x7FFF_FFFF) as i32;
+
+        let mut req = BytesMut::with_capacity(12);
+        req.put_u16(Opcode::Lodata as u16);
+        req.put_u16(2); // subCom = 2 (LO_WRITE)
+        req.put_u16(lofd_u16);
+        req.put_i32(req_len);
+        req.put_u16(32000); // bufferSize
+
+        self.stream.write_all(&req).await?;
+
+        // Stream chunks of at most 32000 bytes
+        let mut rem = data;
+        while !rem.is_empty() {
+            let chunk_size = rem.len().min(32000);
+            let mut ch_hdr = [0u8; 2];
+            ch_hdr[0] = (chunk_size >> 8) as u8;
+            ch_hdr[1] = (chunk_size & 0xFF) as u8;
+            self.stream.write_all(&ch_hdr).await?;
+            self.stream.write_all(&rem[..chunk_size]).await?;
+            if chunk_size % 2 != 0 {
+                self.stream.write_all(&[0u8]).await?;
+            }
+            rem = &rem[chunk_size..];
+        }
+
+        // Send SQ_EOT
+        let mut eot = BytesMut::with_capacity(2);
+        eot.put_u16(Opcode::Eot as u16);
+        self.stream.write_all(&eot).await?;
+        self.stream.flush().await?;
+
+        // Receive write ack: opcode(2), optype(2), file_size(4)
+        let resp_op = loop {
+            let op = self.stream.read_u16().await?;
+            if op != Opcode::Eot as u16 {
+                break op;
+            }
+        };
+
+
+        if resp_op == Opcode::Err as u16 {
+            let sqlcode = self.stream.read_u16().await? as i16;
+            let isamcode = self.stream.read_u16().await? as i16;
+            self.stream.drain(if self.capabilities.remove_64k_limit { 4 } else { 2 }).await?;
+            let msg = self.read_str().await?;
+            return Err(Error::Server {
+                sqlcode: sqlcode as i32,
+                isamcode: isamcode as i32,
+                sqlstate: "".to_string(),
+                message: msg,
+            });
+        }
+
+        if resp_op != Opcode::Lodata as u16 {
+            return Err(Error::Protocol(format!(
+                "Unexpected opcode in smartblob write response: {resp_op}"
+            )));
+        }
+
+        let optype = self.stream.read_u16().await?;
+        let resp_size = self.stream.read_u32().await? as i32;
+
+        self.drain_sblob_trailing().await?;
+
+        if optype != 2 || resp_size < 0 {
+            return Err(Error::Protocol(format!(
+                "smartblob write failed: optype={optype} resp_size={resp_size}"
+            )));
+        }
+
+        Ok(data.len())
+    }
+
+    /// Convenience method to read Smart-LOB content directly given a hex locator.
+    pub async fn read_sblob(&mut self, locator_hex: &str, max_bytes: usize) -> Result<Vec<u8>> {
+        let lofd = self.sblob_open(locator_hex, 4).await?;
+        let res = self.sblob_read(lofd, max_bytes).await;
+        let _ = self.sblob_close(lofd).await;
+        res
+    }
+
+    async fn drain_sblob_trailing(&mut self) -> Result<()> {
+        loop {
+            if let Some(next) = self.stream.peek_u16(10).await? {
+                if next == Opcode::Eot as u16 {
+                    let _ = self.stream.read_u16().await?;
+                    break;
+                } else if next == Opcode::Done as u16 {
+                    let _ = self.stream.read_u16().await?;
+                    self.stream.drain(10).await?;
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        Ok(())
+    }
 }
+
+/// Represents the execution result of a single statement in a batch.
+#[derive(Debug)]
+pub struct BatchItemResult {
+    pub status: Result<()>,
+    pub rows_affected: i64,
+}
+
+/// Collection of batch execution items.
+#[derive(Debug)]
+pub struct BatchResult {
+    pub items: Vec<BatchItemResult>,
+}
+
+impl BatchResult {
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    pub fn success_count(&self) -> usize {
+        self.items.iter().filter(|i| i.status.is_ok()).count()
+    }
+
+    pub fn error_count(&self) -> usize {
+        self.items.iter().filter(|i| i.status.is_err()).count()
+    }
+}
+
+/// Cancellation handle to interrupt active queries on a connection out-of-band.
+#[derive(Debug, Clone, Copy)]
+pub struct CancelHandle {
+    #[cfg(unix)]
+    fd: std::os::unix::io::RawFd,
+}
+
+impl CancelHandle {
+    /// Sends an urgent out-of-band TCP cancellation byte to interrupt the running query.
+    pub fn cancel(&self) -> Result<()> {
+        #[cfg(unix)]
+        {
+            let interrupt_byte = 0x42u8;
+            let sent = unsafe {
+                libc::send(
+                    self.fd,
+                    &interrupt_byte as *const _ as *const libc::c_void,
+                    1,
+                    libc::MSG_OOB | libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+                )
+            };
+            if sent == 1 {
+                Ok(())
+            } else {
+                Err(Error::Io(std::io::Error::last_os_error()))
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            Err(Error::Protocol("Cancellation is not supported on this platform".to_string()))
+        }
+    }
+}
+

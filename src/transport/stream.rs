@@ -157,4 +157,11 @@ impl SqliStream {
 
         Ok((header, body))
     }
+
+    #[cfg(unix)]
+    pub fn raw_fd(&self) -> std::os::unix::io::RawFd {
+        use std::os::unix::io::AsRawFd;
+        self.stream.as_raw_fd()
+    }
 }
+

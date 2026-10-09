@@ -18,7 +18,10 @@ pub enum ParameterValue {
     Decimal(Decimal, u16),   // value, qualifier
     DateTime(DateTime, u16), // value, qualifier
     Interval(Interval, u16), // value, qualifier
+    /// Smart Large Object (BLOB / CLOB) locator parameter: (is_clob, locator_bytes)
+    Sblob(bool, Vec<u8>),
 }
+
 
 impl ParameterValue {
     pub fn wire_type(&self) -> u8 {
@@ -33,8 +36,10 @@ impl ParameterValue {
             Self::Decimal(_, _) => 5, // SQLI_TYPE_DECIMAL
             Self::DateTime(_, _) => 10, // SQLI_TYPE_DATETIME
             Self::Interval(_, _) => 14, // SQLI_TYPE_INTERVAL
+            Self::Sblob(_, _) => 44,    // SQLI_TYPE_BLOB / SQLI_TYPE_CLOB wire type 44
         }
     }
+
 
     pub fn encode_into(&self, buf: &mut BytesMut) {
         match self {
@@ -144,6 +149,26 @@ impl ParameterValue {
                     buf.put_u16(0);
                 }
             }
+            Self::Sblob(is_clob, locator_bytes) => {
+                buf.put_u16(44); // type 44
+                buf.put_u16(0);  // owner length = 0
+                let tname = if *is_clob { "clob" } else { "blob" };
+                let tnlen = tname.len() as u16;
+                buf.put_u16(tnlen);
+                buf.put_slice(tname.as_bytes());
+                if (2 + tnlen as usize) % 2 != 0 {
+                    buf.put_u8(0);
+                }
+                buf.put_u16(0); // null indicator = 0
+                buf.put_u16(0); // encoded_length = 0
+                let blen = locator_bytes.len() as u32;
+                buf.put_u32(blen);
+                buf.put_slice(locator_bytes);
+                if (4 + blen as usize) % 2 != 0 {
+                    buf.put_u8(0);
+                }
+            }
         }
     }
 }
+
