@@ -1242,9 +1242,11 @@ impl Connection {
                 fd: self.stream.raw_fd(),
             }
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
         {
-            CancelHandle {}
+            CancelHandle {
+                socket: self.stream.raw_socket(),
+            }
         }
     }
 
@@ -1620,14 +1622,21 @@ impl BatchResult {
 pub struct CancelHandle {
     #[cfg(unix)]
     fd: std::os::unix::io::RawFd,
+    #[cfg(windows)]
+    socket: std::os::windows::io::RawSocket,
 }
 
 impl CancelHandle {
     /// Sends an urgent out-of-band TCP cancellation byte to interrupt the running query.
+    ///
+    /// Uses native OS urgent data:
+    /// - On Unix: `libc::send(fd, ..., MSG_OOB)`
+    /// - On Windows: Winsock `send(socket, ..., MSG_OOB)`
     pub fn cancel(&self) -> Result<()> {
+        let interrupt_byte = 0x42u8;
+
         #[cfg(unix)]
         {
-            let interrupt_byte = 0x42u8;
             let sent = unsafe {
                 libc::send(
                     self.fd,
@@ -1642,9 +1651,23 @@ impl CancelHandle {
                 Err(Error::Io(std::io::Error::last_os_error()))
             }
         }
-        #[cfg(not(unix))]
+
+        #[cfg(windows)]
         {
-            Err(Error::Protocol("Cancellation is not supported on this platform".to_string()))
+            use windows_sys::Win32::Networking::WinSock::{send, MSG_OOB, SOCKET, SOCKET_ERROR};
+            let sent = unsafe {
+                send(
+                    self.socket as SOCKET,
+                    &interrupt_byte as *const u8,
+                    1,
+                    MSG_OOB as i32,
+                )
+            };
+            if sent != SOCKET_ERROR && sent == 1 {
+                Ok(())
+            } else {
+                Err(Error::Io(std::io::Error::last_os_error()))
+            }
         }
     }
 }

@@ -15,7 +15,12 @@ libc = "0.2"
 encoding_rs = { version = "0.8.42", default-features = false, features = ["alloc"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_System_SystemInformation", "Win32_System_WindowsProgramming", "Win32_System_Registry"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_System_SystemInformation",
+    "Win32_System_WindowsProgramming",
+    "Win32_System_Registry",
+    "Win32_Networking_WinSock",
+] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

@@ -163,5 +163,11 @@ impl SqliStream {
         use std::os::unix::io::AsRawFd;
         self.stream.as_raw_fd()
     }
+
+    #[cfg(windows)]
+    pub fn raw_socket(&self) -> std::os::windows::io::RawSocket {
+        use std::os::windows::io::AsRawSocket;
+        self.stream.as_raw_socket()
+    }
 }
 
