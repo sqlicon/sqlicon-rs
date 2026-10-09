@@ -1,0 +1,192 @@
+//! SQLI protocol opcodes.
+
+use crate::error::{Error, Result};
+use std::fmt;
+
+/// SQLI Protocol message opcodes (SQ_*).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u16)]
+pub enum Opcode {
+    Command = 1,
+    Prepare = 2,
+    Id = 4,
+    Bind = 5,
+    Execute = 7,
+    Describe = 8,
+    Nfetch = 9,
+    Close = 10,
+    Release = 11,
+    Eot = 12,
+    Err = 13,
+    Tuple = 14,
+    Done = 15,
+    Cmmtwork = 19,
+    Rbwork = 20,
+    Svpoint = 21,
+    Ndescribe = 22,
+    Sfetch = 23,
+    Scroll = 24,
+    Tupid = 25,
+    Begin = 35,
+    Dbopen = 36,
+    Dbclose = 37,
+    Fetchblob = 38,
+    Blob = 39,
+    Bbind = 41,
+    Hold = 43,
+    Isolevel = 47,
+    Lockwait = 48,
+    Wantdone = 49,
+    Version = 53,
+    Cost = 55,
+    Exit = 56,
+    Info = 81,
+    Reassoc = 86,
+    Insertdone = 94,
+    Lodata = 97,
+    File = 98,
+    Xactstat = 99,
+    RetType = 100,
+    Protocols = 126,
+    Accept = 127,
+    Ack = 128,
+    Challenge = 129,
+    Response = 130,
+    Vput = 133,
+    Sqlisetsvpt = 137,
+    Sqlirelsvpt = 138,
+    Sqlirbacksvpt = 139,
+    Batchstart = 141,
+    Batchend = 142,
+}
+
+impl Opcode {
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Self::Command => "SQ_COMMAND",
+            Self::Prepare => "SQ_PREPARE",
+            Self::Id => "SQ_ID",
+            Self::Bind => "SQ_BIND",
+            Self::Execute => "SQ_EXECUTE",
+            Self::Describe => "SQ_DESCRIBE",
+            Self::Nfetch => "SQ_NFETCH",
+            Self::Close => "SQ_CLOSE",
+            Self::Release => "SQ_RELEASE",
+            Self::Eot => "SQ_EOT",
+            Self::Err => "SQ_ERR",
+            Self::Tuple => "SQ_TUPLE",
+            Self::Done => "SQ_DONE",
+            Self::Cmmtwork => "SQ_CMMTWORK",
+            Self::Rbwork => "SQ_RBWORK",
+            Self::Svpoint => "SQ_SVPOINT",
+            Self::Ndescribe => "SQ_NDESCRIBE",
+            Self::Sfetch => "SQ_SFETCH",
+            Self::Scroll => "SQ_SCROLL",
+            Self::Tupid => "SQ_TUPID",
+            Self::Begin => "SQ_BEGIN",
+            Self::Dbopen => "SQ_DBOPEN",
+            Self::Dbclose => "SQ_DBCLOSE",
+            Self::Fetchblob => "SQ_FETCHBLOB",
+            Self::Blob => "SQ_BLOB",
+            Self::Bbind => "SQ_BBIND",
+            Self::Hold => "SQ_HOLD",
+            Self::Isolevel => "SQ_ISOLEVEL",
+            Self::Lockwait => "SQ_LOCKWAIT",
+            Self::Wantdone => "SQ_WANTDONE",
+            Self::Version => "SQ_VERSION",
+            Self::Cost => "SQ_COST",
+            Self::Exit => "SQ_EXIT",
+            Self::Info => "SQ_INFO",
+            Self::Reassoc => "SQ_REASSOC",
+            Self::Insertdone => "SQ_INSERTDONE",
+            Self::Lodata => "SQ_LODATA",
+            Self::File => "SQ_FILE",
+            Self::Xactstat => "SQ_XACTSTAT",
+            Self::RetType => "SQ_RET_TYPE",
+            Self::Protocols => "SQ_PROTOCOLS",
+            Self::Accept => "SQ_ACCEPT",
+            Self::Ack => "SQ_ACK",
+            Self::Challenge => "SQ_CHALLENGE",
+            Self::Response => "SQ_RESPONSE",
+            Self::Vput => "SQ_VPUT",
+            Self::Sqlisetsvpt => "SQ_SQLISETSVPT",
+            Self::Sqlirelsvpt => "SQ_SQLIRELSVPT",
+            Self::Sqlirbacksvpt => "SQ_SQLIRBACKSVPT",
+            Self::Batchstart => "SQ_BATCHSTART",
+            Self::Batchend => "SQ_BATCHEND",
+        }
+    }
+
+    pub const fn from_u16(val: u16) -> Option<Self> {
+        match val {
+            1 => Some(Self::Command),
+            2 => Some(Self::Prepare),
+            4 => Some(Self::Id),
+            5 => Some(Self::Bind),
+            7 => Some(Self::Execute),
+            8 => Some(Self::Describe),
+            9 => Some(Self::Nfetch),
+            10 => Some(Self::Close),
+            11 => Some(Self::Release),
+            12 => Some(Self::Eot),
+            13 => Some(Self::Err),
+            14 => Some(Self::Tuple),
+            15 => Some(Self::Done),
+            19 => Some(Self::Cmmtwork),
+            20 => Some(Self::Rbwork),
+            21 => Some(Self::Svpoint),
+            22 => Some(Self::Ndescribe),
+            23 => Some(Self::Sfetch),
+            24 => Some(Self::Scroll),
+            25 => Some(Self::Tupid),
+            35 => Some(Self::Begin),
+            36 => Some(Self::Dbopen),
+            37 => Some(Self::Dbclose),
+            38 => Some(Self::Fetchblob),
+            39 => Some(Self::Blob),
+            41 => Some(Self::Bbind),
+            43 => Some(Self::Hold),
+            47 => Some(Self::Isolevel),
+            48 => Some(Self::Lockwait),
+            49 => Some(Self::Wantdone),
+            53 => Some(Self::Version),
+            55 => Some(Self::Cost),
+            56 => Some(Self::Exit),
+            81 => Some(Self::Info),
+            86 => Some(Self::Reassoc),
+            94 => Some(Self::Insertdone),
+            97 => Some(Self::Lodata),
+            98 => Some(Self::File),
+            99 => Some(Self::Xactstat),
+            100 => Some(Self::RetType),
+            126 => Some(Self::Protocols),
+            127 => Some(Self::Accept),
+            128 => Some(Self::Ack),
+            129 => Some(Self::Challenge),
+            130 => Some(Self::Response),
+            133 => Some(Self::Vput),
+            137 => Some(Self::Sqlisetsvpt),
+            138 => Some(Self::Sqlirelsvpt),
+            139 => Some(Self::Sqlirbacksvpt),
+            141 => Some(Self::Batchstart),
+            142 => Some(Self::Batchend),
+            _ => None,
+        }
+    }
+}
+
+impl TryFrom<u16> for Opcode {
+    type Error = Error;
+
+    fn try_from(val: u16) -> Result<Self> {
+        Self::from_u16(val).ok_or_else(|| {
+            Error::Protocol(format!("Unknown or unhandled opcode: {val}"))
+        })
+    }
+}
+
+impl fmt::Display for Opcode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.name())
+    }
+}
