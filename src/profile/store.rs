@@ -59,11 +59,25 @@ pub struct ProfileStore {
 
 impl ProfileStore {
     pub fn config_dir() -> Result<PathBuf> {
+        #[cfg(windows)]
+        {
+            if let Ok(appdata) = std::env::var("APPDATA") {
+                if !appdata.is_empty() {
+                    return Ok(PathBuf::from(appdata).join("sqlicon"));
+                }
+            }
+            if let Ok(userprofile) = std::env::var("USERPROFILE") {
+                if !userprofile.is_empty() {
+                    return Ok(PathBuf::from(userprofile).join("AppData").join("Roaming").join("sqlicon"));
+                }
+            }
+        }
         let home = std::env::var("HOME").map_err(|_| {
-            Error::Configuration("HOME environment variable not set".into())
+            Error::Configuration("HOME (or APPDATA) environment variable not set".into())
         })?;
         Ok(PathBuf::from(home).join(".config").join("sqlicon"))
     }
+
 
     pub fn config_file() -> Result<PathBuf> {
         Ok(Self::config_dir()?.join("profiles.conf"))

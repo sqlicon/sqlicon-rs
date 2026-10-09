@@ -450,21 +450,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if let Some(ref name) = args.profile_create {
-        let mut p = Profile::new(name);
-        p.host = args.host.clone();
-        p.port = args.port.clone();
-        p.server = args.server.clone();
-        p.database = args.database.clone();
-        p.user = args.user.clone();
-        p.password = args.password.clone();
-        p.client_locale = args.client_locale.clone();
-        p.db_locale = args.db_locale.clone();
+        let mut p = if let Some(ref uri) = args.connect_uri {
+            let cp = ConnectParams::from_uri(uri)?;
+            let mut prof = Profile::new(name);
+            prof.host = Some(cp.hostname);
+            prof.port = Some(cp.service);
+            prof.server = Some(cp.server);
+            prof.database = cp.database;
+            prof.user = Some(cp.username);
+            prof.password = Some(cp.password);
+            prof.client_locale = Some(cp.client_locale);
+            prof.db_locale = Some(cp.db_locale);
+            prof
+        } else {
+            let mut prof = Profile::new(name);
+            prof.host = args.host.clone();
+            prof.port = args.port.clone();
+            prof.server = args.server.clone();
+            prof.database = args.database.clone();
+            prof.user = args.user.clone();
+            prof.password = args.password.clone();
+            prof.client_locale = args.client_locale.clone();
+            prof.db_locale = args.db_locale.clone();
+            prof
+        };
+
+        if let Some(ref v) = args.host { p.host = Some(v.clone()); }
+        if let Some(ref v) = args.port { p.port = Some(v.clone()); }
+        if let Some(ref v) = args.server { p.server = Some(v.clone()); }
+        if let Some(ref v) = args.database { p.database = Some(v.clone()); }
+        if let Some(ref v) = args.user { p.user = Some(v.clone()); }
+        if let Some(ref v) = args.password { p.password = Some(v.clone()); }
+        if let Some(ref v) = args.client_locale { p.client_locale = Some(v.clone()); }
+        if let Some(ref v) = args.db_locale { p.db_locale = Some(v.clone()); }
 
         store.profiles.insert(name.clone(), p);
         store.save()?;
         println!("Profile '{name}' created.");
         return Ok(());
     }
+
 
     if let Some(ref name) = args.profile_update {
         let p = match store.profiles.get_mut(name) {
