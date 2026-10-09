@@ -169,6 +169,9 @@ pub enum Error {
 
     #[error("Unsupported operation: {0}")]
     Unsupported(String),
+
+    #[error("Configuration error: {0}")]
+    Configuration(String),
 }
 
 impl Error {
@@ -187,6 +190,7 @@ impl Error {
             Self::NullValue => Status::NullValue,
             Self::Canceled => Status::Canceled,
             Self::Unsupported(_) => Status::Unsupported,
+            Self::Configuration(_) => Status::InvalidArgument,
         }
     }
 }

@@ -392,6 +392,92 @@ impl Row {
             Ok(Some(dt))
         }
     }
+
+    /// Returns a string representation suitable for table display (or "NULL" if null).
+    pub fn get_display_value(&self, index: usize) -> Result<String> {
+        let col = self.columns.get(index).ok_or_else(|| {
+            Error::OutOfRange(format!("Column {index} out of range"))
+        })?;
+
+        let raw = match self.get_raw_column(index)? {
+            Some(r) => r,
+            None => return Ok("NULL".to_string()),
+        };
+
+        match col.col_type {
+            ColumnType::Char | ColumnType::NChar | ColumnType::VarChar | ColumnType::NVarChar | ColumnType::LVarChar => {
+                let s = std::str::from_utf8(raw)
+                    .map(|s| s.trim_end().to_string())
+                    .unwrap_or_else(|_| String::from_utf8_lossy(raw).trim_end().to_string());
+                Ok(s)
+            }
+            ColumnType::SmallInt => {
+                if raw.len() == 2 {
+                    Ok(i16::from_be_bytes([raw[0], raw[1]]).to_string())
+                } else {
+                    Ok("NULL".to_string())
+                }
+            }
+            ColumnType::Int | ColumnType::Serial => {
+                if raw.len() == 4 {
+                    Ok(i32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]).to_string())
+                } else {
+                    Ok("NULL".to_string())
+                }
+            }
+            ColumnType::BigInt | ColumnType::BigSerial => {
+                if raw.len() == 8 {
+                    Ok(i64::from_be_bytes([raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7]]).to_string())
+                } else if raw.len() == 4 {
+                    Ok((i32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]) as i64).to_string())
+                } else {
+                    Ok("NULL".to_string())
+                }
+            }
+            ColumnType::Float => {
+                if raw.len() == 8 {
+                    Ok(f64::from_be_bytes([raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7]]).to_string())
+                } else {
+                    Ok("NULL".to_string())
+                }
+            }
+            ColumnType::SmallFloat => {
+                if raw.len() == 4 {
+                    Ok(f32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]).to_string())
+                } else {
+                    Ok("NULL".to_string())
+                }
+            }
+            ColumnType::Bool | ColumnType::DBoolean => {
+                if raw.is_empty() {
+                    Ok("NULL".to_string())
+                } else {
+                    Ok(if raw[0] != 0 { "t".to_string() } else { "f".to_string() })
+                }
+            }
+            ColumnType::Date => {
+                match date_decode_wire(raw) {
+                    Ok(d) if !d.is_null => Ok(d.to_string()),
+                    _ => Ok("NULL".to_string()),
+                }
+            }
+            ColumnType::DateTime => {
+                match datetime_decode_wire(raw, col.encoded_length as u16) {
+                    Ok(dt) if !dt.is_null => Ok(dt.to_string()),
+                    _ => Ok("NULL".to_string()),
+                }
+            }
+            ColumnType::Decimal | ColumnType::Money => {
+                match decimal_decode_wire(raw, col.encoded_length as u16) {
+                    Ok(dec) if !dec.is_null => Ok(dec.to_string()),
+                    _ => Ok("NULL".to_string()),
+                }
+            }
+            _ => {
+                Ok(String::from_utf8_lossy(raw).trim_end().to_string())
+            }
+        }
+    }
 }
 
 #[cfg(test)]

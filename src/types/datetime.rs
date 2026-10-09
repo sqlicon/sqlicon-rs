@@ -454,6 +454,44 @@ pub fn interval_decode_wire(bytes: &[u8], qualifier: u16) -> Result<Interval> {
     })
 }
 
+impl std::fmt::Display for DateTime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.is_null {
+            return write!(f, "NULL");
+        }
+        if self.hour == 0 && self.minute == 0 && self.second == 0 && self.nanosecond == 0 {
+            write!(f, "{:04}-{:02}-{:02}", self.year, self.month, self.day)
+        } else if self.nanosecond > 0 {
+            let millis = self.nanosecond / 1_000_000;
+            write!(
+                f,
+                "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
+                self.year, self.month, self.day, self.hour, self.minute, self.second, millis
+            )
+        } else {
+            write!(
+                f,
+                "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                self.year, self.month, self.day, self.hour, self.minute, self.second
+            )
+        }
+    }
+}
+
+impl std::fmt::Display for Interval {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.is_null {
+            return write!(f, "NULL");
+        }
+        let sign = if self.negative { "-" } else { "" };
+        write!(
+            f,
+            "{}{}-{:02} {:02}:{:02}:{:02}",
+            sign, self.days, self.hours, self.minutes, self.seconds, self.nanosecond / 1_000_000
+        )
+    }
+}
+
 pub fn interval_encode_wire(value: &Interval, qualifier: u16, bytes: &mut [u8]) -> Result<usize> {
     let range = decode_range(qualifier, true)?;
     let mut fields = [0u64; 8];
