@@ -8,6 +8,8 @@ use std::str::FromStr;
 pub const DECIMAL_LIMB_BASE: u32 = 1_000_000_000;
 pub const DECIMAL_LIMB_DIGITS: usize = 9;
 pub const DECIMAL_MAX_DIGITS: usize = 1_000_000;
+/// Mirrors libsqli's `SQLI_DECIMAL_MAX_TEXT` (`SQLI_DECIMAL_MAX_DIGITS + 32`).
+pub const DECIMAL_MAX_TEXT: usize = DECIMAL_MAX_DIGITS + 32;
 pub const DECIMAL_WIRE_CAPACITY: usize = 18;
 
 const MAX_PRECISION: u8 = 32;
@@ -174,6 +176,12 @@ impl FromStr for Decimal {
         if text.is_empty() {
             return Err(Error::InvalidArgument("Empty decimal string".into()));
         }
+        if text.len() > DECIMAL_MAX_TEXT {
+            return Err(Error::OutOfRange(format!(
+                "Decimal text length {} exceeds maximum of {DECIMAL_MAX_TEXT}",
+                text.len()
+            )));
+        }
         let bytes = text.as_bytes();
         let mut pos = 0;
         let mut negative = false;
@@ -209,6 +217,11 @@ impl FromStr for Decimal {
         if digits == 0 {
             return Err(Error::InvalidArgument("No digits in decimal string".into()));
         }
+        if significant_digits > DECIMAL_MAX_DIGITS {
+            return Err(Error::OutOfRange(format!(
+                "Decimal has {significant_digits} significant digits, exceeds maximum of {DECIMAL_MAX_DIGITS}"
+            )));
+        }
 
         let mantissa_end = pos;
         let mut exponent: i64 = 0;
@@ -237,7 +250,11 @@ impl FromStr for Decimal {
             }
         }
 
-        let scale = ((fractional as i64) - exponent) as i32;
+        let fractional_i64 = fractional as i64;
+        if exponent < fractional_i64 - (i32::MAX as i64) || exponent > fractional_i64 - (i32::MIN as i64) {
+            return Err(Error::OutOfRange("Decimal scale exceeds i32 range".into()));
+        }
+        let scale = (fractional_i64 - exponent) as i32;
         let count = (significant_digits + DECIMAL_LIMB_DIGITS - 1) / DECIMAL_LIMB_DIGITS;
         let mut limbs = vec![0u32; count];
 

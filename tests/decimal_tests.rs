@@ -175,6 +175,29 @@ fn test_parse_rejects_malformed() {
 }
 
 #[test]
+fn test_parse_rejects_oversized_and_overflowing_input() {
+    use sqlicon_rs::types::decimal::{DECIMAL_MAX_DIGITS, DECIMAL_MAX_TEXT};
+
+    // Text longer than SQLI_DECIMAL_MAX_TEXT must be rejected, not silently
+    // accepted into an unbounded Vec<u32> allocation.
+    let oversized_text = "1".repeat(DECIMAL_MAX_TEXT + 1);
+    assert!(oversized_text.parse::<Decimal>().is_err());
+
+    // More significant digits than SQLI_DECIMAL_MAX_DIGITS must be rejected.
+    let too_many_digits = "1".repeat(DECIMAL_MAX_DIGITS + 1);
+    assert!(too_many_digits.parse::<Decimal>().is_err());
+
+    // A reasonable-length mantissa with a wildly out-of-range exponent must
+    // not silently wrap when computing scale = fractional - exponent as i32.
+    assert!("1E+2147483649".parse::<Decimal>().is_err());
+    assert!("1E-2147483649".parse::<Decimal>().is_err());
+
+    // Sanity: a large-but-in-bounds value still parses fine.
+    let ok_text = "1".repeat(DECIMAL_MAX_DIGITS);
+    assert!(ok_text.parse::<Decimal>().is_ok());
+}
+
+#[test]
 fn test_int64_boundaries_and_null() {
     let null_dec = Decimal::null();
     assert!(null_dec.is_null);
