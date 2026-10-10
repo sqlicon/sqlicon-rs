@@ -36,6 +36,34 @@ pub struct TurnResult {
     pub row_id: i64,
     pub warnings: u16,
     pub saw_done: bool,
+    /// Generated SERIAL/SERIAL8/BIGSERIAL id, from the DONE `errd1` field or
+    /// a trailing SQ_INSERTDONE (opcode 94) payload.
+    pub generated_serial: Option<i64>,
+}
+
+/// Decodes the 10-byte Informix INT8 wire format used by SQ_INSERTDONE's
+/// SERIAL8 payload: `[sign: i16 BE][lo32: u32 BE][hi32: u32 BE]`. Mirrors
+/// libsqli's `sqli_decode_ifx_int8` (sqli_dispatch.c). Returns `None` when
+/// `sign == 0`, matching the C function's `is_null` output for that case.
+fn decode_ifx_int8_serial(buf: &[u8; 10]) -> Option<i64> {
+    let sign = i16::from_be_bytes([buf[0], buf[1]]);
+    if sign == 0 {
+        return None;
+    }
+    let lo = u32::from_be_bytes([buf[2], buf[3], buf[4], buf[5]]) as u64;
+    let hi = u32::from_be_bytes([buf[6], buf[7], buf[8], buf[9]]) as u64;
+    let mag = (hi << 32) | lo;
+    Some(if sign < 0 {
+        if mag >= (i64::MAX as u64 + 1) {
+            i64::MIN
+        } else {
+            -(mag as i64)
+        }
+    } else if mag > i64::MAX as u64 {
+        i64::MAX
+    } else {
+        mag as i64
+    })
 }
 
 pub fn is_likely_opcode(v: u16) -> bool {
@@ -57,7 +85,7 @@ pub fn is_likely_opcode(v: u16) -> bool {
         | 13 // SQLI_SQ_ERR
         | 14 // SQLI_SQ_TUPLE
         | 15 // SQLI_SQ_DONE
-        | 16 // SQLI_SQ_BEGIN
+        | 35 // SQLI_SQ_BEGIN
         | 19 // SQLI_SQ_RET_TYPE
         | 22 // SQLI_SQ_NDESCRIBE
         | 25 // SQLI_SQ_TUPID
@@ -131,6 +159,16 @@ impl Connection {
 
     pub async fn connect(params: ConnectParams) -> Result<Self> {
         let is_unix_socket = params.service.starts_with('/');
+
+        // libsqli (sqli_handshake.c) unconditionally clears the password for
+        // onipcstr connections before any downstream auth step (local Unix
+        // sockets authenticate via OS credentials, not a transmitted
+        // password), so a PAM challenge received over this transport must
+        // not echo back whatever password the caller happened to supply.
+        let mut params = params;
+        if is_unix_socket {
+            params.password.clear();
+        }
 
         let (mut stream, mut caps) = if is_unix_socket {
             #[cfg(unix)]
@@ -617,7 +655,10 @@ impl Connection {
                         self.stream.read_exact(&mut b4).await?;
                         turn.row_id = i32::from_be_bytes(b4) as i64;
                     }
-                    let _errd1 = self.stream.read_u32().await?;
+                    let errd1 = self.stream.read_u32().await?;
+                    if errd1 != 0 && turn.rows_affected > 0 {
+                        turn.generated_serial = Some(errd1 as i32 as i64);
+                    }
 
                     // Adaptive tail peek for errd2, errd3
                     if let Some(next) = self.stream.peek_u16(10).await? {
@@ -683,8 +724,14 @@ impl Connection {
                     self.drain_info().await?;
                 }
                 94 => {
-                    // SQ_INSERTDONE
-                    self.stream.drain(10).await?;
+                    // SQ_INSERTDONE: 10-byte SERIAL8 payload (Informix INT8
+                    // wire format), overriding any 32-bit value already
+                    // captured from DONE's errd1 for SERIAL8/BIGSERIAL columns.
+                    let mut buf10 = [0u8; 10];
+                    self.stream.read_exact(&mut buf10).await?;
+                    if let Some(generated) = decode_ifx_int8_serial(&buf10) {
+                        turn.generated_serial = Some(generated);
+                    }
                 }
                 99 => {
                     // SQ_XACTSTAT
@@ -711,7 +758,7 @@ impl Connection {
         self.drain_pending_turns().await?;
 
         let qmarks = sql.chars().filter(|&c| c == '?').count() as u16;
-        let sql_bytes = crate::types::charset::encode_string_to_db(sql, Some(&self.params.db_locale));
+        let sql_bytes = crate::types::charset::encode_string_to_db(sql, Some(&self.params.db_locale))?;
 
         let mut pkt = BytesMut::with_capacity(16 + sql_bytes.len());
         pkt.put_u16(Opcode::Prepare as u16); // 2
@@ -804,7 +851,7 @@ impl Connection {
             bind_pkt.put_u16(Opcode::Bind as u16);
             bind_pkt.put_u16(params.len() as u16);
             for p in params {
-                p.encode_into_with_locale(&mut bind_pkt, Some(&self.params.db_locale));
+                p.encode_into_with_locale(&mut bind_pkt, Some(&self.params.db_locale))?;
             }
             bind_pkt.put_u16(Opcode::Eot as u16);
 
@@ -846,7 +893,7 @@ impl Connection {
             bind_pkt.put_u16(Opcode::Bind as u16);
             bind_pkt.put_u16(params.len() as u16);
             for p in params {
-                p.encode_into_with_locale(&mut bind_pkt, Some(&self.params.db_locale));
+                p.encode_into_with_locale(&mut bind_pkt, Some(&self.params.db_locale))?;
             }
             bind_pkt.put_u16(Opcode::Eot as u16);
 
@@ -878,6 +925,7 @@ impl Connection {
         let mut all_rows = Vec::new();
         let rows_affected;
         let last_warnings;
+        let mut generated_serial: Option<i64> = None;
 
         loop {
             let prev_count = all_rows.len();
@@ -899,6 +947,9 @@ impl Connection {
             turn = self.dispatch_turn(turn).await?;
 
             all_rows.extend(turn.rows);
+            if turn.generated_serial.is_some() {
+                generated_serial = turn.generated_serial;
+            }
 
             if all_rows.len() == prev_count || turn.saw_done {
                 rows_affected = turn.rows_affected;
@@ -907,7 +958,7 @@ impl Connection {
             }
         }
 
-        Ok(QueryResult::new(columns, all_rows, rows_affected, None, last_warnings))
+        Ok(QueryResult::new(columns, all_rows, rows_affected, generated_serial, last_warnings))
     }
 
     /// Executes a SELECT query and returns the complete [`QueryResult`].
@@ -955,6 +1006,7 @@ impl Connection {
         let mut all_rows = Vec::new();
         let rows_affected;
         let last_warnings;
+        let mut generated_serial: Option<i64> = None;
 
         loop {
             let prev_count = all_rows.len();
@@ -976,6 +1028,9 @@ impl Connection {
             turn = self.dispatch_turn(turn).await?;
 
             all_rows.extend(turn.rows);
+            if turn.generated_serial.is_some() {
+                generated_serial = turn.generated_serial;
+            }
 
             if all_rows.len() == prev_count || turn.saw_done {
                 rows_affected = turn.rows_affected;
@@ -985,7 +1040,7 @@ impl Connection {
         }
 
         self.close_statement(stmt_id).await?;
-        Ok(QueryResult::new(columns, all_rows, rows_affected, None, last_warnings))
+        Ok(QueryResult::new(columns, all_rows, rows_affected, generated_serial, last_warnings))
     }
 
     /// Prepares an SQL query, opens a cursor, and returns a [`crate::result::RowStream`]
@@ -1805,3 +1860,62 @@ impl CancelHandle {
     }
 }
 
+
+#[cfg(test)]
+mod generated_serial_tests {
+    use super::*;
+
+    #[test]
+    fn decode_ifx_int8_serial_zero_sign_is_null() {
+        // sign == 0 means "no value" (is_null in libsqli's
+        // sqli_decode_ifx_int8), used by SQ_INSERTDONE to signal that no
+        // SERIAL8/BIGSERIAL id was generated for this insert.
+        let buf = [0u8; 10];
+        assert_eq!(decode_ifx_int8_serial(&buf), None);
+    }
+
+    #[test]
+    fn decode_ifx_int8_serial_positive_value() {
+        // sign=+1, lo32=42, hi32=0 -> 42
+        let mut buf = [0u8; 10];
+        buf[0..2].copy_from_slice(&1i16.to_be_bytes());
+        buf[2..6].copy_from_slice(&42u32.to_be_bytes());
+        buf[6..10].copy_from_slice(&0u32.to_be_bytes());
+        assert_eq!(decode_ifx_int8_serial(&buf), Some(42));
+    }
+
+    #[test]
+    fn decode_ifx_int8_serial_negative_value() {
+        // sign=-1, lo32=100, hi32=0 -> -100
+        let mut buf = [0u8; 10];
+        buf[0..2].copy_from_slice(&(-1i16).to_be_bytes());
+        buf[2..6].copy_from_slice(&100u32.to_be_bytes());
+        buf[6..10].copy_from_slice(&0u32.to_be_bytes());
+        assert_eq!(decode_ifx_int8_serial(&buf), Some(-100));
+    }
+
+    #[test]
+    fn decode_ifx_int8_serial_large_bigserial_value() {
+        // A BIGSERIAL-range value spanning both 32-bit words:
+        // hi32=1, lo32=0 -> magnitude 2^32.
+        let mut buf = [0u8; 10];
+        buf[0..2].copy_from_slice(&1i16.to_be_bytes());
+        buf[2..6].copy_from_slice(&0u32.to_be_bytes());
+        buf[6..10].copy_from_slice(&1u32.to_be_bytes());
+        assert_eq!(decode_ifx_int8_serial(&buf), Some(1i64 << 32));
+    }
+
+    #[test]
+    fn decode_ifx_int8_serial_saturates_at_i64_bounds() {
+        // Magnitude exceeding i64::MAX saturates instead of wrapping,
+        // matching libsqli's saturating cast.
+        let mut buf = [0u8; 10];
+        buf[0..2].copy_from_slice(&1i16.to_be_bytes());
+        buf[2..6].copy_from_slice(&u32::MAX.to_be_bytes());
+        buf[6..10].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert_eq!(decode_ifx_int8_serial(&buf), Some(i64::MAX));
+
+        buf[0..2].copy_from_slice(&(-1i16).to_be_bytes());
+        assert_eq!(decode_ifx_int8_serial(&buf), Some(i64::MIN));
+    }
+}
