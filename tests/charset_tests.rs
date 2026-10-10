@@ -59,31 +59,46 @@ fn test_all_catalog_locales_resolve() {
 fn test_multilingual_roundtrips() {
     // 1. German Umlauts & Euro in CP1252
     let german_text = "abzüglich bereits berechneter Abschläge: 150 €";
-    let cp1252_encoded = encode_string_to_db(german_text, Some("de_DE.1252"));
-    let german_decoded = decode_wire_string(&cp1252_encoded, Some("de_DE.1252"));
+    let cp1252_encoded = encode_string_to_db(german_text, Some("de_DE.1252")).unwrap();
+    let german_decoded = decode_wire_string(&cp1252_encoded, Some("de_DE.1252")).unwrap();
     assert_eq!(german_decoded, german_text);
 
     // 2. Central European in CP1250
     let polish_text = "Zażółć gęślą jaźń";
-    let cp1250_encoded = encode_string_to_db(polish_text, Some("pl_PL.1250"));
-    let polish_decoded = decode_wire_string(&cp1250_encoded, Some("pl_PL.1250"));
+    let cp1250_encoded = encode_string_to_db(polish_text, Some("pl_PL.1250")).unwrap();
+    let polish_decoded = decode_wire_string(&cp1250_encoded, Some("pl_PL.1250")).unwrap();
     assert_eq!(polish_decoded, polish_text);
 
     // 3. Cyrillic in CP1251
     let russian_text = "Привет мир Informix";
-    let cp1251_encoded = encode_string_to_db(russian_text, Some("ru_RU.1251"));
-    let russian_decoded = decode_wire_string(&cp1251_encoded, Some("ru_RU.1251"));
+    let cp1251_encoded = encode_string_to_db(russian_text, Some("ru_RU.1251")).unwrap();
+    let russian_decoded = decode_wire_string(&cp1251_encoded, Some("ru_RU.1251")).unwrap();
     assert_eq!(russian_decoded, russian_text);
 
     // 4. Japanese Shift_JIS in CP932
     let japanese_text = "日本語テスト";
-    let cp932_encoded = encode_string_to_db(japanese_text, Some("ja_JP.932"));
-    let japanese_decoded = decode_wire_string(&cp932_encoded, Some("ja_JP.932"));
+    let cp932_encoded = encode_string_to_db(japanese_text, Some("ja_JP.932")).unwrap();
+    let japanese_decoded = decode_wire_string(&cp932_encoded, Some("ja_JP.932")).unwrap();
     assert_eq!(japanese_decoded, japanese_text);
 
     // 5. UTF-8 pass-through
     let utf8_text = "🚀 Universal UTF-8 String 🌍";
-    let utf8_encoded = encode_string_to_db(utf8_text, Some("en_US.utf8"));
-    let utf8_decoded = decode_wire_string(&utf8_encoded, Some("en_US.utf8"));
+    let utf8_encoded = encode_string_to_db(utf8_text, Some("en_US.utf8")).unwrap();
+    let utf8_decoded = decode_wire_string(&utf8_encoded, Some("en_US.utf8")).unwrap();
     assert_eq!(utf8_decoded, utf8_text);
+}
+
+#[test]
+fn test_cp852_857_864_catalog_locales_resolve() {
+    assert_eq!(resolve_locale("pl_PL.852").expect("852").canonical_name, "CP852");
+    assert_eq!(resolve_locale("tr_TR.857").expect("857").canonical_name, "CP857");
+    assert_eq!(resolve_locale("ar_SA.864").expect("864").canonical_name, "CP864");
+}
+
+#[test]
+fn test_incomplete_oem_codepage_errors_on_undefined_byte() {
+    // CP857's decoding table has gaps (it's an "Incomplete" OEM table);
+    // byte 0xD5 is one such gap. Decoding it must error rather than
+    // silently falling back to lossy UTF-8 or substituting U+FFFD.
+    assert!(decode_wire_string(&[0xD5], Some("tr_TR.857")).is_err());
 }

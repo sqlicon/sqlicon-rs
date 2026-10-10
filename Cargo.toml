@@ -13,6 +13,9 @@ aes-gcm = "0.10"
 base64 = "0.22"
 libc = "0.2"
 encoding_rs = { version = "0.8.42", default-features = false, features = ["alloc"] }
+# encoding_rs has no codecs for the DOS single-byte code pages CP852/857/864;
+# oem_cp supplies those (pure Rust, no_std+alloc) to fill that gap.
+oem_cp = { version = "2", default-features = false, features = ["alloc"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [

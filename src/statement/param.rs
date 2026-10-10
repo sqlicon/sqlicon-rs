@@ -1,5 +1,6 @@
 //! Parameter binding types for Informix Prepared Statements.
 
+use crate::error::Result;
 use crate::types::date::{date_encode_wire, Date};
 use crate::types::datetime::{datetime_encode_wire, interval_encode_wire, DateTime, Interval};
 use crate::types::decimal::{decimal_encode_wire, Decimal};
@@ -41,11 +42,11 @@ impl ParameterValue {
     }
 
 
-    pub fn encode_into(&self, buf: &mut BytesMut) {
-        self.encode_into_with_locale(buf, None);
+    pub fn encode_into(&self, buf: &mut BytesMut) -> Result<()> {
+        self.encode_into_with_locale(buf, None)
     }
 
-    pub fn encode_into_with_locale(&self, buf: &mut BytesMut, db_locale: Option<&str>) {
+    pub fn encode_into_with_locale(&self, buf: &mut BytesMut, db_locale: Option<&str>) -> Result<()> {
         match self {
             Self::Null => {
                 buf.put_u16(0); // type 0
@@ -73,7 +74,7 @@ impl ParameterValue {
             Self::String(s) => {
                 buf.put_u16(13); // type VARCHAR
                 buf.put_u16(0);
-                let encoded_bytes = crate::types::charset::encode_string_to_db(s, db_locale);
+                let encoded_bytes = crate::types::charset::encode_string_to_db(s, db_locale)?;
                 let slen = encoded_bytes.len() as u16;
                 buf.put_u16(slen);
                 buf.put_u16(slen);
@@ -174,6 +175,7 @@ impl ParameterValue {
                 }
             }
         }
+        Ok(())
     }
 }
 

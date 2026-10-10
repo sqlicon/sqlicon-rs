@@ -132,8 +132,41 @@ impl Row {
         }
 
         match col.col_type {
-            ColumnType::Bool | ColumnType::DBoolean | ColumnType::LVarChar | ColumnType::Blob | ColumnType::Clob => {
-                // 5-byte prefix [null_marker: u8][len: u32 BE]
+            ColumnType::Bool | ColumnType::DBoolean | ColumnType::Blob | ColumnType::Clob => {
+                // 5-byte prefix [null_marker: u8][len: u32 BE]. Unlike
+                // LVARCHAR below, libsqli's sqli_result.c treats BOOL/
+                // DBOOLEAN and BLOB/CLOB as NULL whenever the resolved
+                // payload length is zero, regardless of the marker byte
+                // (sqli_type_all_zero_is_null_sentinel / the unconditional
+                // BOOL is_null=1 rule in sqli_result_prepare_row_cache).
+                if base + 5 <= buf.len() {
+                    let null_marker = buf[base];
+                    let len = u32::from_be_bytes([buf[base + 1], buf[base + 2], buf[base + 3], buf[base + 4]]) as usize;
+                    if len == 0 {
+                        return Ok(None);
+                    }
+                    if null_marker == 0 && base + 5 + len <= buf.len() {
+                        return Ok(Some(&buf[base + 5..base + 5 + len]));
+                    }
+                }
+                // Fallback to 2-byte prefix [len: u16 BE]
+                if base + 2 <= buf.len() {
+                    let len = u16::from_be_bytes([buf[base], buf[base + 1]]) as usize;
+                    if len == 0 {
+                        return Ok(None);
+                    }
+                    if base + 2 + len <= buf.len() {
+                        return Ok(Some(&buf[base + 2..base + 2 + len]));
+                    }
+                }
+                Err(Error::Protocol("Invalid variable column framing".into()))
+            }
+            ColumnType::LVarChar => {
+                // 5-byte prefix [null_marker: u8][len: u32 BE]. NULL only
+                // when the marker byte is set; a zero-length value with a
+                // zero marker is a present-but-empty string, not NULL
+                // (sqli_is_stringy_type(LVARCHAR) excludes it from the
+                // unconditional all-zero-is-null rule applied to BLOB/CLOB).
                 if base + 5 <= buf.len() {
                     let null_marker = buf[base];
                     let len = u32::from_be_bytes([buf[base + 1], buf[base + 2], buf[base + 3], buf[base + 4]]) as usize;
@@ -355,7 +388,7 @@ impl Row {
             None => return Ok(None),
         };
 
-        let decoded = crate::types::charset::decode_wire_string(raw, self.db_locale.as_deref());
+        let decoded = crate::types::charset::decode_wire_string(raw, self.db_locale.as_deref())?;
         Ok(Some(decoded.trim_end().to_string()))
     }
 
@@ -538,7 +571,7 @@ impl Row {
 
         match col.col_type {
             ColumnType::Char | ColumnType::NChar | ColumnType::VarChar | ColumnType::NVarChar | ColumnType::LVarChar => {
-                let decoded = crate::types::charset::decode_wire_string(raw, self.db_locale.as_deref());
+                let decoded = crate::types::charset::decode_wire_string(raw, self.db_locale.as_deref())?;
                 Ok(decoded.trim_end().to_string())
             }
             ColumnType::SmallInt => {
@@ -693,5 +726,38 @@ mod tests {
         let row = Row::new(tuple, cols);
         assert_eq!(row.get_i32(0).unwrap(), None);
         assert_eq!(row.get_i16(1).unwrap(), None);
+    }
+
+    #[test]
+    fn test_zero_length_null_sentinel_differs_by_type() {
+        // BLOB/CLOB: zero-length payload is always NULL, regardless of the
+        // marker byte (matches libsqli's unconditional all-zero-is-null
+        // rule for these types in sqli_result_prepare_row_cache).
+        let blob_cols = vec![ColumnInfo::new("b", ColumnType::Blob, 0, 0, 0, 1)];
+        let zero_marker_zero_len = vec![0u8, 0, 0, 0, 0];
+        let row = Row::new(zero_marker_zero_len.clone(), blob_cols);
+        assert_eq!(row.get_raw_column(0).unwrap(), None);
+
+        let nonzero_marker_zero_len = vec![1u8, 0, 0, 0, 0];
+        let clob_cols = vec![ColumnInfo::new("c", ColumnType::Clob, 0, 0, 0, 1)];
+        let row = Row::new(nonzero_marker_zero_len, clob_cols);
+        assert_eq!(row.get_raw_column(0).unwrap(), None);
+
+        // LVARCHAR: zero-length with a zero marker is a present-but-empty
+        // string, NOT null (sqli_is_stringy_type(LVARCHAR) excludes it from
+        // the BLOB/CLOB all-zero-is-null rule).
+        let lvarchar_cols = vec![ColumnInfo::new("s", ColumnType::LVarChar, 0, 0, 0, 1)];
+        let row = Row::new(zero_marker_zero_len, lvarchar_cols);
+        assert_eq!(row.get_raw_column(0).unwrap(), Some(&[][..]));
+
+        // LVARCHAR with a nonzero marker and zero length IS null.
+        let lvarchar_cols2 = vec![ColumnInfo::new("s", ColumnType::LVarChar, 0, 0, 0, 1)];
+        let row = Row::new(vec![1u8, 0, 0, 0, 0], lvarchar_cols2);
+        assert_eq!(row.get_raw_column(0).unwrap(), None);
+
+        // BOOL: zero-length payload is always NULL regardless of marker.
+        let bool_cols = vec![ColumnInfo::new("flag", ColumnType::Bool, 0, 0, 0, 1)];
+        let row = Row::new(vec![0u8, 0, 0, 0, 0], bool_cols);
+        assert_eq!(row.get_raw_column(0).unwrap(), None);
     }
 }
