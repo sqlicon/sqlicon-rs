@@ -1,5 +1,6 @@
 //! Parameter binding types for Informix Prepared Statements.
 
+use crate::connection::sblob::{SblobHandle, SblobType};
 use crate::error::Result;
 use crate::types::column_type::ColumnType;
 use crate::types::date::{date_encode_wire, Date};
@@ -8,6 +9,11 @@ use crate::types::decimal::{decimal_encode_wire, Decimal};
 use bytes::{BufMut, BytesMut};
 
 /// Parameter values that can be bound to a PreparedStatement.
+///
+/// `Decimal`/`DateTime`/`Interval` have no `From` impl: binding one always requires an
+/// explicit protocol qualifier (`ParameterValue::Decimal(value, qualifier)`), so there is
+/// no single-argument conversion to offer. Every other variant has one, so most call sites
+/// can bind with `.into()` instead of naming the variant.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ParameterValue {
     Null,
@@ -20,10 +26,84 @@ pub enum ParameterValue {
     Decimal(Decimal, u16),   // value, qualifier
     DateTime(DateTime, u16), // value, qualifier
     Interval(Interval, u16), // value, qualifier
-    /// Smart Large Object (BLOB / CLOB) locator parameter: (is_clob, locator_bytes)
-    Sblob(bool, Vec<u8>),
+    /// Smart Large Object (BLOB / CLOB) locator parameter.
+    Sblob(SblobType, Vec<u8>),
 }
 
+impl From<i16> for ParameterValue {
+    fn from(v: i16) -> Self {
+        Self::Int(i32::from(v))
+    }
+}
+
+impl From<i32> for ParameterValue {
+    fn from(v: i32) -> Self {
+        Self::Int(v)
+    }
+}
+
+impl From<i64> for ParameterValue {
+    fn from(v: i64) -> Self {
+        Self::BigInt(v)
+    }
+}
+
+impl From<f32> for ParameterValue {
+    fn from(v: f32) -> Self {
+        Self::Float(f64::from(v))
+    }
+}
+
+impl From<f64> for ParameterValue {
+    fn from(v: f64) -> Self {
+        Self::Float(v)
+    }
+}
+
+impl From<String> for ParameterValue {
+    fn from(v: String) -> Self {
+        Self::String(v)
+    }
+}
+
+impl From<&str> for ParameterValue {
+    fn from(v: &str) -> Self {
+        Self::String(v.to_owned())
+    }
+}
+
+impl From<Vec<u8>> for ParameterValue {
+    fn from(v: Vec<u8>) -> Self {
+        Self::Bytes(v)
+    }
+}
+
+impl From<&[u8]> for ParameterValue {
+    fn from(v: &[u8]) -> Self {
+        Self::Bytes(v.to_vec())
+    }
+}
+
+impl From<Date> for ParameterValue {
+    fn from(v: Date) -> Self {
+        Self::Date(v)
+    }
+}
+
+/// `None` binds SQL `NULL`; `Some(v)` binds `v` via its own `Into<ParameterValue>`.
+impl<T: Into<ParameterValue>> From<Option<T>> for ParameterValue {
+    fn from(v: Option<T>) -> Self {
+        v.map_or(Self::Null, Into::into)
+    }
+}
+
+/// Binds the locator a prior [`Connection::sblob_create`](crate::Connection::sblob_create)
+/// returned, so the caller doesn't have to destructure `SblobHandle` by hand.
+impl From<&SblobHandle> for ParameterValue {
+    fn from(handle: &SblobHandle) -> Self {
+        Self::Sblob(handle.sblob_type, handle.locator.clone())
+    }
+}
 
 impl ParameterValue {
     pub fn wire_type(&self) -> u8 {
@@ -255,10 +335,13 @@ impl ParameterValue {
                     buf.put_u16(0);
                 }
             }
-            Self::Sblob(is_clob, locator_bytes) => {
+            Self::Sblob(sblob_type, locator_bytes) => {
                 buf.put_u16(44); // type 44
                 buf.put_u16(0);  // owner length = 0
-                let tname = if *is_clob { "clob" } else { "blob" };
+                let tname = match sblob_type {
+                    SblobType::Blob => "blob",
+                    SblobType::Clob => "clob",
+                };
                 let tnlen = tname.len() as u16;
                 buf.put_u16(tnlen);
                 buf.put_slice(tname.as_bytes());
@@ -276,6 +359,45 @@ impl ParameterValue {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod from_impl_tests {
+    use super::*;
+
+    #[test]
+    fn primitive_from_impls_wrap_the_expected_variant() {
+        assert_eq!(ParameterValue::from(42i32), ParameterValue::Int(42));
+        assert_eq!(ParameterValue::from(42i16), ParameterValue::Int(42));
+        assert_eq!(ParameterValue::from(42i64), ParameterValue::BigInt(42));
+        assert_eq!(ParameterValue::from(1.5f64), ParameterValue::Float(1.5));
+        assert_eq!(ParameterValue::from(1.5f32), ParameterValue::Float(1.5));
+        assert_eq!(ParameterValue::from("x"), ParameterValue::String("x".into()));
+        assert_eq!(ParameterValue::from(String::from("x")), ParameterValue::String("x".into()));
+        assert_eq!(ParameterValue::from(vec![1u8, 2]), ParameterValue::Bytes(vec![1, 2]));
+        assert_eq!(ParameterValue::from(&[1u8, 2][..]), ParameterValue::Bytes(vec![1, 2]));
+    }
+
+    #[test]
+    fn option_from_impl_distinguishes_null_from_a_value() {
+        let some: ParameterValue = Some(7i32).into();
+        assert_eq!(some, ParameterValue::Int(7));
+        let none: ParameterValue = Option::<i32>::None.into();
+        assert_eq!(none, ParameterValue::Null);
+    }
+
+    #[test]
+    fn sblob_handle_from_impl_reuses_its_type_and_locator() {
+        let handle = SblobHandle {
+            lofd: 1,
+            sblob_type: SblobType::Clob,
+            locator: vec![0xAB, 0xCD],
+        };
+        assert_eq!(
+            ParameterValue::from(&handle),
+            ParameterValue::Sblob(SblobType::Clob, vec![0xAB, 0xCD])
+        );
     }
 }
 
