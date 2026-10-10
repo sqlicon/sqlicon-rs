@@ -900,6 +900,66 @@ impl Connection {
         Ok(turn.rows_affected)
     }
 
+    /// Streams the actual bytes for any parameter bound against a server-declared legacy
+    /// `BYTE`/`TEXT` placeholder, via `SQ_BBIND` (opcode 41) followed by one or more data
+    /// chunks (opcode 39, max 1024 bytes each, odd lengths padded) and a zero-length
+    /// terminator chunk per parameter. Matches `libsqli`'s `sqli_stmt_execute_bound_params`:
+    /// the main `SQ_BIND` message only carries a 56-byte placeholder descriptor for such
+    /// parameters (see [`ParameterValue::encode_bind_entry`]); the real data follows here.
+    /// Must be sent after the `SQ_BIND` message and before `SQ_EXECUTE`. A no-op if no
+    /// parameter needs streaming.
+    async fn send_legacy_lob_stream(
+        &mut self,
+        stmt: &PreparedStatement,
+        params: &[crate::statement::ParameterValue],
+    ) -> Result<()> {
+        let streaming: Vec<(usize, &crate::statement::ParameterValue, ColumnType)> = params
+            .iter()
+            .enumerate()
+            .filter_map(|(i, p)| {
+                let server_type = stmt.param_server_type(i)?;
+                p.needs_lob_streaming(Some(server_type)).then_some((i, p, server_type))
+            })
+            .collect();
+
+        if streaming.is_empty() {
+            return Ok(());
+        }
+
+        let mut hdr = BytesMut::with_capacity(4);
+        hdr.put_u16(Opcode::Bbind as u16);
+        hdr.put_u16(streaming.len() as u16);
+        self.stream.write_all(&hdr).await?;
+
+        for (_, p, server_type) in streaming {
+            let data = p.lob_stream_bytes(Some(&self.params.db_locale), server_type)?;
+            let mut remaining = data.as_slice();
+            while !remaining.is_empty() {
+                let chunk_len = remaining.len().min(1024);
+                let (chunk, rest) = remaining.split_at(chunk_len);
+                remaining = rest;
+
+                let mut ch = BytesMut::with_capacity(4 + chunk_len + 1);
+                ch.put_u16(Opcode::Blob as u16);
+                ch.put_u16(chunk_len as u16);
+                ch.put_slice(chunk);
+                if chunk_len % 2 != 0 {
+                    ch.put_u8(0);
+                }
+                self.stream.write_all(&ch).await?;
+            }
+
+            // Zero-length terminator chunk for this parameter.
+            let mut term = BytesMut::with_capacity(4);
+            term.put_u16(Opcode::Blob as u16);
+            term.put_u16(0);
+            self.stream.write_all(&term).await?;
+        }
+
+        self.stream.flush().await?;
+        Ok(())
+    }
+
     /// Executes a previously prepared DML/DDL statement with bound parameters.
     ///
     /// Binds parameter values via `SQ_BIND` and executes the statement with `SQ_EXECUTE`.
@@ -923,13 +983,15 @@ impl Connection {
             bind_pkt.put_u16(stmt_id);
             bind_pkt.put_u16(Opcode::Bind as u16);
             bind_pkt.put_u16(params.len() as u16);
-            for p in params {
-                p.encode_into_with_locale(&mut bind_pkt, Some(&self.params.db_locale))?;
+            for (i, p) in params.iter().enumerate() {
+                p.encode_bind_entry(&mut bind_pkt, Some(&self.params.db_locale), stmt.param_server_type(i))?;
             }
             bind_pkt.put_u16(Opcode::Eot as u16);
 
             self.stream.write_all(&bind_pkt).await?;
             self.stream.flush().await?;
+
+            self.send_legacy_lob_stream(stmt, params).await?;
         }
 
         // 2. Send SQ_ID + SQ_EXECUTE + SQ_EOT
@@ -967,13 +1029,15 @@ impl Connection {
             bind_pkt.put_u16(stmt_id);
             bind_pkt.put_u16(Opcode::Bind as u16);
             bind_pkt.put_u16(params.len() as u16);
-            for p in params {
-                p.encode_into_with_locale(&mut bind_pkt, Some(&self.params.db_locale))?;
+            for (i, p) in params.iter().enumerate() {
+                p.encode_bind_entry(&mut bind_pkt, Some(&self.params.db_locale), stmt.param_server_type(i))?;
             }
             bind_pkt.put_u16(Opcode::Eot as u16);
 
             self.stream.write_all(&bind_pkt).await?;
             self.stream.flush().await?;
+
+            self.send_legacy_lob_stream(stmt, params).await?;
         }
 
         // 2. Open cursor
@@ -1575,12 +1639,12 @@ impl Connection {
                 "cancelable execute requires an active transaction when autocommit is off (call begin() first)".into(),
             ));
         }
-        if params
-            .iter()
-            .any(|p| matches!(p, crate::statement::ParameterValue::Sblob(_, _)))
-        {
+        if params.iter().enumerate().any(|(i, p)| {
+            matches!(p, crate::statement::ParameterValue::Sblob(_, _))
+                || p.needs_lob_streaming(stmt.param_server_type(i))
+        }) {
             return Err(Error::Unsupported(
-                "cancelable execute does not support Smart-LOB parameters".into(),
+                "cancelable execute does not support Smart-LOB or legacy BYTE/TEXT streamed parameters".into(),
             ));
         }
         if !self.stream.is_tcp() {
@@ -1607,8 +1671,10 @@ impl Connection {
             bind_pkt.put_u16(stmt_id);
             bind_pkt.put_u16(Opcode::Bind as u16);
             bind_pkt.put_u16(params.len() as u16);
-            for p in params {
-                if let Err(e) = p.encode_into_with_locale(&mut bind_pkt, Some(&self.params.db_locale)) {
+            for (i, p) in params.iter().enumerate() {
+                if let Err(e) =
+                    p.encode_bind_entry(&mut bind_pkt, Some(&self.params.db_locale), stmt.param_server_type(i))
+                {
                     operation.abort_unregistered();
                     return Err(e);
                 }
