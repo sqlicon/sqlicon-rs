@@ -16,6 +16,11 @@ encoding_rs = { version = "0.8.42", default-features = false, features = ["alloc
 # encoding_rs has no codecs for the DOS single-byte code pages CP852/857/864;
 # oem_cp supplies those (pure Rust, no_std+alloc) to fill that gap.
 oem_cp = { version = "2", default-features = false, features = ["alloc"] }
+# Pure-Rust TLS for the onsocssl transport, mirroring libsqli's OpenSSL-backed sqli_tls.c.
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls-native-certs = "0.8"
+rustls-pemfile = "2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
@@ -27,5 +32,7 @@ windows-sys = { version = "0.61", features = [
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 
 

@@ -236,8 +236,20 @@ impl Connection {
                 Error::InvalidArgument(format!("Invalid port or service: {}", params.service))
             })?;
 
-            debug!("Connecting to {}:{}", params.hostname, port);
-            let mut stream = SqliStream::connect(&params.hostname, port).await?;
+            let ssl_enabled = params.ssl_enable || std::env::var("SQLI_SSL_ENABLE").is_ok_and(|v| {
+                matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+            });
+            let mut stream = if ssl_enabled {
+                debug!("Connecting to {}:{} over TLS", params.hostname, port);
+                SqliStream::connect_tls(&params.hostname, port, &params).await?
+            } else {
+                debug!("Connecting to {}:{}", params.hostname, port);
+                SqliStream::connect(&params.hostname, port).await?
+            };
+            // The SL/CONREQ handshake and everything after it is identical whether or not TLS
+            // wraps the socket: libsqli sends the same "tlitcp" transport tag for both
+            // onsoctcp and onsocssl, since the TLS session is transparent below the SQLI
+            // protocol (sqli_handshake.c).
             debug!("Connected TCP socket, initiating SL/CONREQ handshake");
 
             // Step 1: Send SL-framed CONREQ

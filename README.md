@@ -16,6 +16,7 @@ A pure, asynchronous IBM Informix Dynamic Server client library and CLI written 
 - **Zero CSDK / Native Client Dependency**: Pure Rust implementation of the SQLI session, handshake, and framing layers (`SL_HEADER`, `CONREQ`, `CONACC`, `SQ_PROTOCOLS`, ASC password encryption).
 - **Multiple Transports**:
   - **TCP Network Socket** (`onsoctcp`, `informix+onsoctcp://`)
+  - **TLS-Encrypted TCP** (`onsocssl`, `informix+onsocssl://`) via pure-Rust `rustls`/`tokio-rustls` -- no OpenSSL dependency. Verifies against the platform's native trust store or a configured CA file by default; see [`ConnectParams::ssl`](src/connection/params.rs).
   - **Local Unix Domain Socket** (`onipcstr`, `informix+onipcstr://` on tmpfs/Linux with "sqAZ" IPC preamble and OS credential handshake)
 - **Asynchronous & Non-blocking**: Built on [Tokio](https://tokio.rs/) for high-throughput, non-blocking asynchronous database operations.
 - **Cross-Platform**: Tested and verified on **Linux** (x86_64) and **Windows** (x86_64).
@@ -91,6 +92,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let res = conn.query("SELECT CURRENT YEAR TO SECOND FROM systables WHERE tabid = 1").await?;
     println!("Server time: {}", res.rows[0].get_display_value(0)?);
+
+    Ok(())
+}
+```
+
+### TLS-Encrypted Connection (`onsocssl`)
+
+```rust
+use sqlicon_rs::{ConnectParams, Connection};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Via URI: the onsocssl scheme enables TLS. SSL_VERIFY_PEER/SSL_CA_FILE are optional
+    // query parameters; without them the connection is encrypted but not certificate-verified.
+    let uri = "informix+onsocssl://informix:secret@127.0.0.1:9443/stores7?INFORMIXSERVER=ol_iep&SSL_VERIFY_PEER=1&SSL_CA_FILE=/etc/ssl/certs/informix-ca.pem";
+    let mut conn = Connection::connect_uri(uri).await?;
+    let _ = conn.query("SELECT FIRST 1 1 FROM systables").await?;
+
+    // Equivalently via ConnectParams:
+    let params = ConnectParams::new("127.0.0.1", "9443", "ol_iep")
+        .database("stores7")
+        .credentials("informix", "secret")
+        .ssl(true, true)
+        .ssl_ca_file("/etc/ssl/certs/informix-ca.pem");
+    let _conn2 = Connection::connect(params).await?;
 
     Ok(())
 }

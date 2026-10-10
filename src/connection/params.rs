@@ -11,6 +11,16 @@ pub struct ConnectParams {
     pub client_locale: String,
     pub db_locale: String,
     pub fetch_buf_size: u32,
+    /// Enables a TLS session (`informix+onsocssl`) before the SQLI handshake, matching
+    /// libsqli's `sqli_tls_connect`. Also enabled by the `SQLI_SSL_ENABLE` environment
+    /// variable at connect time, as in libsqli.
+    pub ssl_enable: bool,
+    /// Verifies the server's certificate chain and hostname (`SSL_VERIFY_PEER`); otherwise
+    /// equivalent to OpenSSL's `SSL_VERIFY_NONE`. Also enabled by `SQLI_SSL_VERIFY`.
+    pub ssl_verify_peer: bool,
+    /// Optional path to a PEM CA bundle; falls back to the platform's native trust store
+    /// (and to `SQLI_SSL_CA_FILE`) when unset, matching `SSL_CTX_set_default_verify_paths`.
+    pub ssl_ca_file: Option<String>,
 }
 
 impl Default for ConnectParams {
@@ -25,6 +35,9 @@ impl Default for ConnectParams {
             client_locale: "en_US.utf8".into(),
             db_locale: "en_US.8859-1".into(),
             fetch_buf_size: 4 * 1024 * 1024,
+            ssl_enable: false,
+            ssl_verify_peer: false,
+            ssl_ca_file: None,
         }
     }
 }
@@ -57,6 +70,20 @@ impl ConnectParams {
     pub fn locales<C: Into<String>, D: Into<String>>(mut self, client: C, db: D) -> Self {
         self.client_locale = client.into();
         self.db_locale = db.into();
+        self
+    }
+
+    /// Enables TLS (`informix+onsocssl`-equivalent) and whether to verify the server's
+    /// certificate chain and hostname. Matches libsqli's `ssl_enable`/`ssl_verify_peer`.
+    pub fn ssl(mut self, enable: bool, verify_peer: bool) -> Self {
+        self.ssl_enable = enable;
+        self.ssl_verify_peer = verify_peer;
+        self
+    }
+
+    /// Sets a PEM CA bundle path used instead of the platform's native trust store.
+    pub fn ssl_ca_file<P: Into<String>>(mut self, path: P) -> Self {
+        self.ssl_ca_file = Some(path.into());
         self
     }
 
@@ -124,6 +151,8 @@ impl ConnectParams {
         let mut client_locale = "en_US.utf8".to_string();
         let mut db_locale = "en_US.8859-1".to_string();
         let mut socket_path = String::new();
+        let mut ssl_verify_peer = false;
+        let mut ssl_ca_file: Option<String> = None;
 
         if let Some(q) = query_str {
             for pair in q.split('&') {
@@ -139,6 +168,10 @@ impl ConnectParams {
                     "CLIENT_LOCALE" => client_locale = v,
                     "DB_LOCALE" => db_locale = v,
                     "SOCKET_PATH" => socket_path = v,
+                    "SSL_VERIFY_PEER" => {
+                        ssl_verify_peer = matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
+                    }
+                    "SSL_CA_FILE" => ssl_ca_file = Some(v),
                     _ => {}
                 }
             }
@@ -200,6 +233,9 @@ impl ConnectParams {
             client_locale,
             db_locale,
             fetch_buf_size: 4 * 1024 * 1024,
+            ssl_enable: scheme == "informix+onsocssl",
+            ssl_verify_peer,
+            ssl_ca_file,
         })
     }
 }
