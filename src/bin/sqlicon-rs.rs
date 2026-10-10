@@ -823,7 +823,7 @@ fn handle_dot_command<'a>(
     conn: &'a mut Connection,
     rt: &'a mut ShellRuntime,
     line: &'a str,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, Box<dyn std::error::Error>>> + 'a>> {
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, Box<dyn std::error::Error + Send + Sync>>> + 'a>> {
     Box::pin(async move {
         let mut parts = line.split_whitespace();
         let cmd = parts.next().unwrap_or("");
@@ -1390,15 +1390,24 @@ fn handle_dot_command<'a>(
     })
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .thread_stack_size(4 * 1024 * 1024)
-        .build()?;
-    rt.block_on(async_main())
+fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Windows default main thread stack is 1MB. In unoptimized debug builds,
+    // large async state machines can exceed 1MB. Spawn a thread with 4MB stack.
+    std::thread::Builder::new()
+        .stack_size(4 * 1024 * 1024)
+        .spawn(|| {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .thread_stack_size(4 * 1024 * 1024)
+                .build()
+                .expect("failed to build tokio runtime");
+            rt.block_on(async_main())
+        })?
+        .join()
+        .map_err(|_| io::Error::new(io::ErrorKind::Other, "main worker thread panicked"))?
 }
 
-async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
+async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args = match parse_cli_args() {
         Ok(a) => a,
         Err(e) => {
