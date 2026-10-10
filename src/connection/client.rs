@@ -360,6 +360,17 @@ impl Connection {
         self.params.database = Some(db);
     }
 
+    /// Checks if the underlying socket is still responsive by executing a lightweight probe.
+    pub async fn ping(&mut self) -> Result<()> {
+        let _ = self.query("SELECT FIRST 1 1 FROM systables").await?;
+        Ok(())
+    }
+
+    /// Returns `true` if the connection state is currently [`ConnectionState::Ready`].
+    pub fn is_alive(&self) -> bool {
+        self.state == ConnectionState::Ready
+    }
+
     async fn read_str(&mut self) -> Result<String> {
         let len = self.stream.read_u16().await? as usize;
         if len == 0 {
@@ -975,6 +986,69 @@ impl Connection {
 
         self.close_statement(stmt_id).await?;
         Ok(QueryResult::new(columns, all_rows, rows_affected, None, last_warnings))
+    }
+
+    /// Prepares an SQL query, opens a cursor, and returns a [`crate::result::RowStream`]
+    /// for fetching rows incrementally one-by-one or in chunks.
+    ///
+    /// This avoids loading entire million-row result sets into memory at once.
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use sqlicon_rs::Connection;
+    /// # async fn run(conn: &mut Connection) -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut stream = conn.query_stream("SELECT tabid, tabname FROM systables").await?;
+    /// while let Some(row) = stream.next().await? {
+    ///     println!("Table: {}", row.get_str(1)?.unwrap_or_default());
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn query_stream(&mut self, sql: &str) -> Result<crate::result::RowStream<'_>> {
+        let stmt = self.prepare(sql).await?;
+        let stmt_id = stmt.id();
+        let columns = stmt.columns().to_vec();
+
+        // 1. Open cursor
+        let curname = b"_ifxc000000000000";
+        let mut open_pkt = BytesMut::with_capacity(32);
+        open_pkt.put_u16(Opcode::Id as u16);
+        open_pkt.put_u16(stmt_id);
+        open_pkt.put_u16(Opcode::Curname as u16);
+        open_pkt.put_u16(curname.len() as u16);
+        open_pkt.put_slice(curname);
+        if curname.len() % 2 != 0 {
+            open_pkt.put_u8(0);
+        }
+        open_pkt.put_u16(Opcode::Open as u16);
+        open_pkt.put_u16(Opcode::Eot as u16);
+
+        self.stream.write_all(&open_pkt).await?;
+        self.stream.flush().await?;
+
+        // Receive OPEN ack turn
+        let _ = self.dispatch_turn(TurnResult::default()).await?;
+
+        Ok(crate::result::RowStream::new(self, stmt_id, columns))
+    }
+
+    /// Fetches a batch of rows from an open cursor.
+    pub(crate) async fn fetch_turn(&mut self, stmt_id: u16, columns: &[crate::result::ColumnInfo]) -> Result<TurnResult> {
+        let fetch_bufsize = 32768u32;
+        let mut fetch_pkt = BytesMut::with_capacity(16);
+        fetch_pkt.put_u16(Opcode::Id as u16);
+        fetch_pkt.put_u16(stmt_id);
+        fetch_pkt.put_u16(Opcode::Nfetch as u16);
+        fetch_pkt.put_u32(fetch_bufsize);
+        fetch_pkt.put_u16(0); // array_size = 0
+        fetch_pkt.put_u16(Opcode::Eot as u16);
+
+        self.stream.write_all(&fetch_pkt).await?;
+        self.stream.flush().await?;
+
+        let mut turn = TurnResult::default();
+        turn.columns = columns.to_vec();
+        self.dispatch_turn(turn).await
     }
 
     /// Closes and releases a statement on the server.
