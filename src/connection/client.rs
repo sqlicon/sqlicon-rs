@@ -1266,14 +1266,10 @@ impl Connection {
         Ok(())
     }
 
-    /// Creates a transaction savepoint with the given name.
-    ///
-    /// Uses native wire opcode `SQ_SQLISETSVPT`.
-    ///
-    /// # Arguments
-    /// * `name` - Identifier for the savepoint.
-    /// * `unique` - Whether the savepoint name must be unique within the transaction.
-    pub async fn savepoint_set(&mut self, name: &str, unique: bool) -> Result<()> {
+    /// Ensures a transaction is active before a savepoint set/release/rollback is sent,
+    /// matching `libsqli`'s `savepoint_send_core` guard (applied uniformly to all three
+    /// savepoint operations): auto-begins when not in autocommit, otherwise errors.
+    async fn ensure_savepoint_txn(&mut self) -> Result<()> {
         if !self.in_transaction {
             if !self.autocommit {
                 self.begin().await?;
@@ -1283,6 +1279,18 @@ impl Connection {
                 ));
             }
         }
+        Ok(())
+    }
+
+    /// Creates a transaction savepoint with the given name.
+    ///
+    /// Uses native wire opcode `SQ_SQLISETSVPT`.
+    ///
+    /// # Arguments
+    /// * `name` - Identifier for the savepoint.
+    /// * `unique` - Whether the savepoint name must be unique within the transaction.
+    pub async fn savepoint_set(&mut self, name: &str, unique: bool) -> Result<()> {
+        self.ensure_savepoint_txn().await?;
 
         let mut pkt = BytesMut::with_capacity(16 + name.len());
         pkt.put_u16(Opcode::Sqlisetsvpt as u16);
@@ -1305,6 +1313,8 @@ impl Connection {
     ///
     /// Uses native wire opcode `SQ_SQLIRELSVPT`.
     pub async fn savepoint_release(&mut self, name: &str) -> Result<()> {
+        self.ensure_savepoint_txn().await?;
+
         let mut pkt = BytesMut::with_capacity(16 + name.len());
         pkt.put_u16(Opcode::Sqlirelsvpt as u16);
         pkt.put_u16(name.len() as u16);
@@ -1325,6 +1335,8 @@ impl Connection {
     ///
     /// Uses native wire opcode `SQ_SQLIRBACKSVPT`.
     pub async fn savepoint_rollback(&mut self, name: &str) -> Result<()> {
+        self.ensure_savepoint_txn().await?;
+
         let mut pkt = BytesMut::with_capacity(16 + name.len());
         pkt.put_u16(Opcode::Sqlirbacksvpt as u16);
         pkt.put_u16(name.len() as u16);
@@ -1413,6 +1425,13 @@ impl Connection {
     /// Executes a prepared DML statement with multiple parameter sets (parameter batching).
     ///
     /// Runs each row of parameters against the prepared statement, collecting individual execution outcomes.
+    ///
+    /// Matches `libsqli`'s `sqli_stmt_batch_execute`: a genuine per-row SQL error returned by
+    /// the server (`Error::Server`) is recorded as that row's failure and the batch continues,
+    /// but any other failure (I/O, protocol, local validation, etc.) means the connection may be
+    /// desynchronized or the row never reached the server — the whole batch is aborted immediately
+    /// and that error is propagated, discarding results collected so far (not reported as a
+    /// per-item failure).
     pub async fn execute_stmt_batch(
         &mut self,
         stmt: &PreparedStatement,
@@ -1427,11 +1446,17 @@ impl Connection {
                         rows_affected: affected,
                     });
                 }
-                Err(e) => {
+                Err(e @ Error::Server { .. }) => {
                     items.push(BatchItemResult {
                         status: Err(e),
                         rows_affected: 0,
                     });
+                }
+                Err(e) => {
+                    // Non-SQL failure (I/O, protocol, local validation): the connection may be
+                    // desynced or this row's SQ_EXECUTE never completed. Abort the whole batch
+                    // rather than silently continuing, matching libsqli's fail-fast behavior.
+                    return Err(e);
                 }
             }
         }
@@ -1770,20 +1795,23 @@ impl Connection {
         res
     }
 
+    /// Drains the trailing SQ_DONE/SQ_EOT opcodes the server always sends after an SQ_LODATA
+    /// read completes. Matches `libsqli`'s `sqli_sblob_read`/`sqli_sblob_read_seek` trailing
+    /// loop (`sqli_sblob.c`): it is a hard protocol guarantee that one of these opcodes follows,
+    /// so this blocks on the read exactly like the rest of this file's dispatch loop does,
+    /// rather than racing a fixed timeout that could truncate the drain under latency and
+    /// desynchronize the next request.
     async fn drain_sblob_trailing(&mut self) -> Result<()> {
         loop {
-            if let Some(next) = self.stream.peek_u16(10).await? {
-                if next == Opcode::Eot as u16 {
-                    let _ = self.stream.read_u16().await?;
-                    break;
-                } else if next == Opcode::Done as u16 {
-                    let _ = self.stream.read_u16().await?;
-                    self.stream.drain(10).await?;
-                } else {
-                    break;
-                }
-            } else {
+            let next = self.stream.read_u16().await?;
+            if next == Opcode::Eot as u16 {
                 break;
+            } else if next == Opcode::Done as u16 {
+                self.stream.drain(10).await?;
+            } else {
+                return Err(Error::Protocol(format!(
+                    "unexpected opcode {next} while draining SQ_LODATA trailer (expected SQ_DONE/SQ_EOT)"
+                )));
             }
         }
         Ok(())

@@ -18,6 +18,12 @@ async fn test_live_transactions_and_savepoints() {
     assert!(!conn.in_transaction());
     assert!(conn.autocommit());
 
+    // savepoint_release/rollback must guard against "no active transaction" the same
+    // way savepoint_set already does, matching libsqli's uniform savepoint_send_core check.
+    assert!(conn.savepoint_release("nope").await.is_err());
+    assert!(conn.savepoint_rollback("nope").await.is_err());
+    assert!(!conn.in_transaction());
+
     let tbl = format!("test_tx_{}", std::process::id());
     let _ = conn.execute(&format!("DROP TABLE {}", tbl)).await;
     conn.execute(&format!("CREATE TABLE {} (id INT, val VARCHAR(30))", tbl))
