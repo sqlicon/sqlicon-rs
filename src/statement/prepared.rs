@@ -49,4 +49,9 @@ impl PreparedStatement {
     pub fn is_query(&self) -> bool {
         !self.columns.is_empty()
     }
+
+    /// Returns the Informix statement type code (e.g. 2 for SELECT).
+    pub fn statement_type(&self) -> u16 {
+        self.statement_type
+    }
 }

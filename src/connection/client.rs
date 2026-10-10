@@ -350,6 +350,16 @@ impl Connection {
         &self.params
     }
 
+    /// Returns a mutable reference to the parameters used for this connection.
+    pub fn params_mut(&mut self) -> &mut ConnectParams {
+        &mut self.params
+    }
+
+    /// Sets the currently active database name in the connection parameters.
+    pub fn set_current_database(&mut self, db: String) {
+        self.params.database = Some(db);
+    }
+
     async fn read_str(&mut self) -> Result<String> {
         let len = self.stream.read_u16().await? as usize;
         if len == 0 {
@@ -754,7 +764,9 @@ impl Connection {
         self.stream.flush().await?;
 
         let turn = self.dispatch_turn(TurnResult::default()).await?;
-        self.close_statement(stmt_id).await?;
+        if stmt.statement_type() == 2 || stmt.is_query() {
+            self.close_statement(stmt_id).await?;
+        }
         Ok(turn.rows_affected)
     }
 

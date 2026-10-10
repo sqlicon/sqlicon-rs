@@ -641,6 +641,14 @@ impl Row {
             }
         }
     }
+
+    /// Returns true if the column value is SQL NULL.
+    pub fn is_null(&self, index: usize) -> bool {
+        match self.get_raw_column(index) {
+            Ok(Some(_)) => false,
+            _ => true,
+        }
+    }
 }
 
 #[cfg(test)]
