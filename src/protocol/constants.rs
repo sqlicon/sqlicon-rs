@@ -26,6 +26,17 @@ pub const TAG_END: u16 = 127;
 pub const SQLI_PROTO_VERSION: u32 = 61;
 pub const SQLI_CLIENT_CAP_1: i32 = 316;
 
+/// DESCRIBE statement-type codes (`sqlstype.h`, not wire opcodes). A statement's SQ_DESCRIBE
+/// response carries one of these; it is the authoritative discriminator for whether the
+/// statement is a query (opens a cursor and produces rows) or DML/DDL (executes directly),
+/// matching `libsqli`'s `sqli_execute`/`sqli_execute_cancelable` checks.
+pub const STMT_UPDATE: u16 = 4;
+pub const STMT_DELETE: u16 = 5;
+pub const STMT_INSERT: u16 = 6;
+pub const STMT_SELECT: u16 = 2;
+/// EXECUTE PROCEDURE/FUNCTION; only a query if it also has output columns (`column_count > 0`).
+pub const STMT_SELECT_RETURNING: u16 = 56;
+
 /// Standard environment variables forwarded during handshake.
 pub const PRIMARY_ENV_VARS: &[&str] = &[
     "INFORMIXSERVER",

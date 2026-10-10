@@ -894,7 +894,7 @@ impl Connection {
 
         let turn = self.dispatch_turn(TurnResult::default()).await?;
         self.last_generated_serial = turn.generated_serial;
-        if stmt.statement_type() == 2 || stmt.is_query() {
+        if stmt.is_query() {
             self.close_statement(stmt_id).await?;
         }
         Ok(turn.rows_affected)
@@ -1560,9 +1560,6 @@ impl Connection {
     ) -> Result<CancelSnapshot> {
         self.ensure_not_discarded()?;
 
-        const STMT_UPDATE: u16 = 4;
-        const STMT_DELETE: u16 = 5;
-        const STMT_INSERT: u16 = 6;
         if !matches!(stmt.statement_type(), STMT_UPDATE | STMT_DELETE | STMT_INSERT) {
             return Err(Error::Unsupported(
                 "cancelable execute only supports prepared UPDATE/DELETE/INSERT".into(),
