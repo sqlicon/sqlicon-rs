@@ -17,8 +17,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("\nTesting prepare: SELECT FIRST 5 tabname, owner FROM systables WHERE tabid >= 100");
             match conn.prepare("SELECT FIRST 5 tabname, owner FROM systables WHERE tabid >= 100").await {
                 Ok(stmt) => {
-                    println!("Prepare succeeded! Stmt ID: {}, columns: {}", stmt.id(), stmt.columns().len());
-                    for (i, col) in stmt.columns().iter().enumerate() {
+                    let columns = stmt.output_columns().unwrap_or(&[]);
+                    println!("Prepare succeeded! Stmt ID: {}, columns: {}", stmt.id(), columns.len());
+                    for (i, col) in columns.iter().enumerate() {
                         println!("  Col #{i}: {} ({}, encoded_len={}, start_pos={})", col.name, col.col_type, col.encoded_length, col.col_start_pos);
                     }
                 }

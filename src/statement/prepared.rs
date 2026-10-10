@@ -42,16 +42,34 @@ impl PreparedStatement {
         self.parameter_count
     }
 
-    /// Returns the list of output column descriptors for query statements.
+    /// Returns the output column descriptors, or `None` if this statement doesn't produce
+    /// result rows (see [`is_query`](Self::is_query)).
     ///
-    /// For a non-query statement (DML/DDL), the server's single `SQ_DESCRIBE` response
-    /// describes input *parameters* instead of output columns, and this same list holds
-    /// those parameter type descriptors — matching `libsqli`'s dual-purpose reuse of the
-    /// DESCRIBE field array (`sqli_prepare.c`'s comment: "DESCRIBE for DML can describe
-    /// input parameters"). Use [`param_server_type`](Self::param_server_type) to read it in
-    /// that case; calling this accessor on a non-query statement returns the same raw data
-    /// mislabeled as columns, so prefer `is_query()` to decide which interpretation applies.
-    pub fn columns(&self) -> &[ColumnInfo] {
+    /// Replaces the previous single `columns()` accessor, which returned the same raw
+    /// `SQ_DESCRIBE` field list regardless of statement type — on a non-query statement
+    /// that list actually holds input *parameter* descriptors (`libsqli`'s dual-purpose
+    /// reuse of the DESCRIBE field array), not output columns, so reading it as columns
+    /// there was mislabeled data the caller had to know to avoid via a separate
+    /// `is_query()` check. Splitting into this and [`param_types`](Self::param_types)
+    /// makes that distinction part of the type instead of a caveat in a doc comment.
+    pub fn output_columns(&self) -> Option<&[ColumnInfo]> {
+        self.is_query().then(|| self.columns.as_slice())
+    }
+
+    /// Returns the input parameter type descriptors, or `None` if this statement produces
+    /// result rows (see [`is_query`](Self::is_query)) — the counterpart to
+    /// [`output_columns`](Self::output_columns). Note this does **not** cover a query
+    /// statement's own placeholders (e.g. `SELECT ... WHERE id = ?`): `libsqli`'s
+    /// `build_bind_msg` consults `param_server_type` unconditionally for those, which is
+    /// why that lookup stays separate and unguarded by statement type.
+    pub fn param_types(&self) -> Option<&[ColumnInfo]> {
+        (!self.is_query()).then(|| self.columns.as_slice())
+    }
+
+    /// Crate-internal raw access to the `SQ_DESCRIBE` field list, regardless of statement
+    /// type — used by the query/fetch paths, which already know (or have just checked)
+    /// that the statement is a query and need the output column schema to decode rows.
+    pub(crate) fn columns_unchecked(&self) -> &[ColumnInfo] {
         &self.columns
     }
 
@@ -96,6 +114,18 @@ mod tests {
     fn select_with_columns_is_a_query() {
         let stmt = PreparedStatement::new(1, STMT_SELECT, 0, vec![col(ColumnType::Int)]);
         assert!(stmt.is_query());
+    }
+
+    #[test]
+    fn output_columns_and_param_types_are_mutually_exclusive() {
+        let query = PreparedStatement::new(1, STMT_SELECT, 0, vec![col(ColumnType::Int)]);
+        assert_eq!(query.output_columns(), Some(&[col(ColumnType::Int)][..]));
+        assert_eq!(query.param_types(), None);
+
+        const STMT_INSERT: u16 = 6;
+        let dml = PreparedStatement::new(1, STMT_INSERT, 1, vec![col(ColumnType::Byte)]);
+        assert_eq!(dml.output_columns(), None);
+        assert_eq!(dml.param_types(), Some(&[col(ColumnType::Byte)][..]));
     }
 
     #[test]

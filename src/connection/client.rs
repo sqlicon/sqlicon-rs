@@ -1191,7 +1191,7 @@ impl Connection {
     ) -> Result<QueryResult> {
         self.ensure_not_discarded()?;
         let stmt_id = stmt.id();
-        let columns = stmt.columns().to_vec();
+        let columns = stmt.columns_unchecked().to_vec();
 
         // 1. If parameters are present, send SQ_ID + SQ_BIND + paramCount + params + SQ_EOT
         if !params.is_empty() {
@@ -1291,7 +1291,7 @@ impl Connection {
     pub async fn query(&mut self, sql: &str) -> Result<QueryResult> {
         let stmt = self.prepare(sql).await?;
         let stmt_id = stmt.id();
-        let columns = stmt.columns().to_vec();
+        let columns = stmt.columns_unchecked().to_vec();
 
         // 1. Open cursor
         let curname = b"_ifxc000000000000";
@@ -1376,7 +1376,7 @@ impl Connection {
     pub async fn query_stream(&mut self, sql: &str) -> Result<crate::result::RowStream<'_>> {
         let stmt = self.prepare(sql).await?;
         let stmt_id = stmt.id();
-        let columns = stmt.columns().to_vec();
+        let columns = stmt.columns_unchecked().to_vec();
 
         // 1. Open cursor
         let curname = b"_ifxc000000000000";
@@ -1511,7 +1511,7 @@ impl Connection {
             ));
         }
         let stmt_id = stmt.id();
-        let columns = stmt.columns().to_vec();
+        let columns = stmt.columns_unchecked().to_vec();
         self.open_cursor(stmt_id, true).await?;
         Ok(crate::result::ScrollCursor::new(self, stmt_id, columns))
     }
@@ -1530,7 +1530,7 @@ impl Connection {
             ));
         }
         let stmt_id = stmt.id();
-        let columns = stmt.columns().to_vec();
+        let columns = stmt.columns_unchecked().to_vec();
 
         if !params.is_empty() {
             let mut bind_pkt = BytesMut::with_capacity(32 + params.len() * 16);
