@@ -78,7 +78,7 @@ pub use error::{lookup_error_message, Error, Result, Status};
 pub use profile::{Profile, ProfileStore};
 pub use protocol::{Opcode, SlHeader};
 pub use result::{ColumnInfo, QueryResult, Row, RowStream};
-pub use statement::{ParameterValue, PreparedStatement};
+pub use statement::{CallResult, CallStatement, ParamMode, ParameterValue, PreparedStatement};
 pub use transport::SqliStream;
 pub use types::{ColumnType, Date, DateTime, Decimal, Interval};
 

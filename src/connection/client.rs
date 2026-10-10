@@ -13,7 +13,7 @@ use crate::protocol::opcodes::Opcode;
 use crate::result::column::ColumnInfo;
 use crate::result::resultset::QueryResult;
 use crate::result::row::Row;
-use crate::statement::PreparedStatement;
+use crate::statement::{CallResult, CallStatement, PreparedStatement};
 use crate::transport::SqliStream;
 use crate::types::column_type::ColumnType;
 use bytes::{BufMut, BytesMut};
@@ -1133,6 +1133,51 @@ impl Connection {
         let turn = self.dispatch_turn(TurnResult::default()).await?;
         self.last_generated_serial = turn.generated_serial;
         Ok(turn.rows_affected)
+    }
+
+    /// Prepares a callable statement (`EXECUTE PROCEDURE`/`EXECUTE FUNCTION`/`CALL`) for use
+    /// with [`call_execute`](Self::call_execute).
+    ///
+    /// This is a thin wrapper around [`prepare`](Self::prepare) -- matching `libsqli`'s
+    /// `sqli_call_prepare`, which has no wire protocol of its own -- so any SQL text `prepare`
+    /// accepts works here too. The returned [`CallStatement`] defaults every placeholder to
+    /// [`ParamMode::In`](crate::statement::ParamMode::In); use
+    /// [`CallStatement::set_param_mode`] beforehand if some placeholders are `OUT`/`INOUT`.
+    pub async fn call_prepare(&mut self, sql: &str) -> Result<CallStatement> {
+        let stmt = self.prepare(sql).await?;
+        Ok(CallStatement::new(stmt))
+    }
+
+    /// Executes a previously prepared callable statement, binding `params` positionally --
+    /// every placeholder (`IN` and `INOUT` alike) must still be bound with a value, since the
+    /// wire protocol has no distinct `OUT`-parameter encoding.
+    ///
+    /// Branches on [`PreparedStatement::is_query`] exactly like `libsqli`'s
+    /// `sqli_call_execute`: a call whose `DESCRIBE` reported output columns is executed via
+    /// the ordinary cursor path and its single output row is returned in
+    /// [`CallResult::row`](crate::statement::CallResult::row) (mirroring `sqli_result_fetch`'s
+    /// one-row pull after execute); a call with no output columns is just executed for its
+    /// rows-affected count.
+    pub async fn call_execute(
+        &mut self,
+        call: &CallStatement,
+        params: &[crate::statement::ParameterValue],
+    ) -> Result<CallResult> {
+        if call.stmt().is_query() {
+            let qr = self.query_stmt(call.stmt(), params).await?;
+            Ok(CallResult {
+                rows_affected: qr.rows_affected,
+                row: qr.rows.into_iter().next(),
+                columns: qr.columns,
+            })
+        } else {
+            let rows_affected = self.execute_stmt(call.stmt(), params).await?;
+            Ok(CallResult {
+                rows_affected,
+                row: None,
+                columns: Vec::new(),
+            })
+        }
     }
 
     /// Executes a previously prepared SELECT statement with bound parameters and returns results.
