@@ -35,4 +35,15 @@ tokio = { version = "1", features = ["full"] }
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 
-
+# See doc/coding_rust.md. Kept at `warn`, not `deny`, so existing code keeps building while
+# new violations surface in `cargo clippy` output -- see CLAUDE.md.
+[lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+indexing_slicing = "warn"
+cast_possible_truncation = "warn"
+cast_sign_loss = "warn"
+cast_possible_wrap = "warn"
+cast_lossless = "warn"
+undocumented_unsafe_blocks = "warn"
