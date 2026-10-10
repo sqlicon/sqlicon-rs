@@ -19,8 +19,10 @@
 //!   (`savepoint_set`, `savepoint_release`, `savepoint_rollback`), and isolation levels (`CommittedRead`, `RepeatableRead`,
 //!   `Serializable`, `CursorStability`).
 //! - **Batch Execution**: Statement batching (`SQ_BATCHSTART`/`SQ_BATCHEND`) and prepared parameter batching.
-//! - **Out-of-band Query Cancellation**: Non-blocking `CancelHandle` using TCP urgent out-of-band interrupts (`MSG_OOB`)
-//!   to abort running operations on the server (`SQLCODE -213`).
+//! - **Out-of-band Query Cancellation**: Single-use `CancelOperation`/`CancelRequester` pair,
+//!   scoped to one prepared `UPDATE`/`DELETE`/`INSERT` executed via
+//!   [`Connection::execute_stmt_cancelable`](connection::client::Connection::execute_stmt_cancelable),
+//!   using a TCP urgent out-of-band interrupt (`MSG_OOB`) to abort it on the server (`SQLCODE -213`).
 //! - **Complete Error Catalog**: Full embedded 3,412-error Informix message catalog with dictionary expansion
 //!   matching C11 `libsqli`.
 //! - **Profile Management**: Profile store with AES-256-GCM encryption derived from machine-specific hardware IDs
@@ -29,7 +31,7 @@
 //! ## Thread and Task Safety
 //!
 //! - A [`Connection`] instance represents a single TCP session and must be accessed exclusively (`&mut self`).
-//! - [`CancelHandle`] is `Send + Sync + Clone` and can be moved across tasks or threads to interrupt in-flight operations safely.
+//! - [`CancelRequester`] is `Send + Sync + Clone` and can be moved to another task or thread to request cancellation of exactly one bound cancelable execute call.
 //! - Prepared statements ([`PreparedStatement`]) and query results ([`QueryResult`]) are owned and can be freely moved across asynchronous tasks.
 //!
 //! ## Quick Start Example
@@ -68,8 +70,9 @@ pub mod transport;
 pub mod types;
 
 pub use connection::{
-    BatchItemResult, BatchResult, CancelHandle, ConnectParams, Connection, ConnectionPool,
-    ConnectionState, IsolationLevel, PoolOptions, PooledConnection, ServerCapabilities,
+    BatchItemResult, BatchResult, CancelDisposition, CancelOperation, CancelOutcome,
+    CancelRequester, CancelSnapshot, ConnectParams, Connection, ConnectionPool, ConnectionState,
+    IsolationLevel, PoolOptions, PooledConnection, ServerCapabilities,
 };
 pub use error::{lookup_error_message, Error, Result, Status};
 pub use profile::{Profile, ProfileStore};

@@ -197,6 +197,17 @@ impl SqliStream {
         Ok((header, body))
     }
 
+    /// Returns `true` if this stream is a TCP socket (as opposed to a Unix domain socket).
+    /// Out-of-band `MSG_OOB` cancellation is only meaningful on TCP, matching libsqli's
+    /// `is_tcp_connection()` check in `sqli_cancel_posix.c`.
+    pub fn is_tcp(&self) -> bool {
+        match &self.stream {
+            InnerStream::Tcp(_) => true,
+            #[cfg(unix)]
+            InnerStream::Unix(_) => false,
+        }
+    }
+
     #[cfg(unix)]
     pub fn raw_fd(&self) -> std::os::unix::io::RawFd {
         use std::os::unix::io::AsRawFd;

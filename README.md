@@ -27,7 +27,7 @@ A pure, asynchronous IBM Informix Dynamic Server client library and CLI written 
 - **Full Database Charset & GLS Support**: Automatic conversion between database encoding (`DB_LOCALE` such as `de_DE.1252` / Windows-1252, ISO-8859-1..15, Shift-JIS, GB2312, Big5, etc.) and Rust UTF-8 `String`s.
 - **Prepared Statements & Parameter Binding**: Fast binary parameter encoding (`?` placeholders) and batched execution.
 - **Transactions & Savepoints**: ANSI and Informix transactions (`begin`, `commit`, `rollback`), named savepoints (`savepoint_set`, `savepoint_release`, `savepoint_rollback`), and isolation levels (`CommittedRead`, `RepeatableRead`, `Serializable`, `CursorStability`).
-- **Out-of-Band TCP Cancellation**: Non-blocking `CancelHandle` using TCP urgent out-of-band interrupts (`MSG_OOB` via POSIX `send` on Unix and Winsock `send` on Windows) to abort long-running queries (`SQLCODE -213`).
+- **Out-of-Band Cancellation**: Single-use `CancelOperation`/`CancelRequester` scoped to one prepared `UPDATE`/`DELETE`/`INSERT`, using TCP urgent out-of-band interrupts (`MSG_OOB` via POSIX `send` on Unix and Winsock `send` on Windows) to abort it on the server (`SQLCODE -213`). The connection is always discarded after a cancellation attempt.
 - **Offline Error Catalog**: Full embedded 3,412-error Informix message catalog with dictionary expansion matching IBM Informix `finderr`.
 - **Encrypted Profile Store**: Built-in CLI profile manager with AES-256-GCM encryption tied to machine-specific hardware IDs (`/etc/machine-id` on Linux, `MachineGuid` on Windows).
 
@@ -179,32 +179,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-### Out-of-Band Query Cancellation
+### Out-of-Band Cancellation of a Prepared DML Statement
 
-Long-running queries can be safely aborted from another Tokio task or thread using `CancelHandle`:
+Cancellation is a single-use capability scoped to exactly one prepared `UPDATE`/`DELETE`/`INSERT`
+execution on a TCP connection (never `SELECT`, batches, or LOB streaming -- matching the native
+Informix client's own restrictions). `CancelRequester` is `Send + Sync + Clone` and can be moved
+to another Tokio task or thread; sending the interrupt always permanently discards the connection
+afterwards, since an out-of-band byte can desynchronize the wire even when the statement completes
+successfully first:
 
 ```rust
 use std::time::Duration;
-use sqlicon_rs::Connection;
+use sqlicon_rs::{CancelOperation, Connection, ParameterValue};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut conn = Connection::connect_uri("informix+onsoctcp://informix:secret@127.0.0.1:9089/stores7?INFORMIXSERVER=ol_iep").await?;
 
-    // Obtain a Send + Sync + Clone handle
-    let cancel_handle = conn.cancel_handle();
+    let stmt = conn.prepare("UPDATE huge_table SET flag = 1 WHERE id > ?").await?;
 
-    // Spawn a worker to cancel query after 1 second
+    let operation = CancelOperation::new();
+    let requester = operation.requester();
+
+    // Spawn a worker to request cancellation after 1 second
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_secs(1)).await;
-        println!("Sending out-of-band cancellation interrupt...");
-        cancel_handle.cancel().expect("Failed to send OOB cancel");
+        println!("Requesting out-of-band cancellation: {:?}", requester.request());
     });
 
-    // Run long-running query
-    match conn.query("SELECT count(*) FROM huge_table, huge_table").await {
-        Ok(_) => println!("Query completed."),
-        Err(e) => println!("Query cancelled as expected: {e}"), // SQLCODE -213
+    let snapshot = conn
+        .execute_stmt_cancelable(&stmt, &[ParameterValue::Int(0)], &operation)
+        .await?;
+    println!("outcome: {:?}", snapshot.outcome); // Executed / Interrupted / Failed / Unknown
+
+    if conn.is_discarded() {
+        println!("connection was discarded after the cancellation attempt; reconnect to continue");
     }
 
     Ok(())
@@ -250,7 +259,7 @@ cargo run -- -P prod -c "SELECT count(*) FROM orders"
 +-------------------------------------------------------------+
          |                                           |
 +--------------------+                     +------------------+
-|   Types & Codesets |                     | CancelHandle     |
+|   Types & Codesets |                     | CancelOperation  |
 | (encoding_rs GLS)  |                     | (TCP MSG_OOB)    |
 +--------------------+                     +------------------+
          |                                           |

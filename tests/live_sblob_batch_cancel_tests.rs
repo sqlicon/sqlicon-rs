@@ -136,16 +136,54 @@ async fn test_live_cancellation_handle() {
         }
     };
 
-    let cancel_handle = conn.cancel_handle();
+    // Unlike the old general-purpose CancelHandle (which could "cancel" an arbitrary SELECT),
+    // libsqli's sqli_execute_cancelable only supports a prepared UPDATE/DELETE/INSERT.
+    let tbl = format!("t_test_live_cancel_{}", std::process::id());
+    let _ = conn.execute(&format!("DROP TABLE {tbl}")).await;
+    conn.execute(&format!("CREATE TABLE {tbl} (id INT, val VARCHAR(30))"))
+        .await
+        .expect("create table failed");
+    conn.execute(&format!("INSERT INTO {tbl} VALUES (1, 'before')"))
+        .await
+        .expect("seed insert failed");
 
-    // Spawn a cancellation task that triggers after 50ms while query executes
+    let stmt = conn
+        .prepare(&format!("UPDATE {tbl} SET val = 'after' WHERE id = ?"))
+        .await
+        .expect("prepare failed");
+
+    let operation = sqlicon_rs::CancelOperation::new();
+    let requester = operation.requester();
+
+    // Request cancellation concurrently. Against a fast local statement the DML will likely
+    // already be done by the time this fires -- CancelOutcome::Executed is a valid, documented
+    // race per libsqli's contract, not a test failure.
     let cancel_task = tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let _ = cancel_handle.cancel();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        requester.request()
     });
 
-    // Execute a query that sleeps on server if possible, or simple query
-    // In Informix, sysmaster:sysdual query is fast, but cancelling should not panic
-    let _ = conn.query("SELECT FIRST 100 tabname FROM sysmaster:systables, sysmaster:systables").await;
-    let _ = cancel_task.await;
+    let params_row = [ParameterValue::Int(1)];
+    let result = conn
+        .execute_stmt_cancelable(&stmt, &params_row, &operation)
+        .await
+        .expect("execute_stmt_cancelable failed");
+    let disposition = cancel_task.await.expect("cancel task panicked");
+    println!("cancel disposition={disposition:?} outcome={:?}", result.outcome);
+
+    assert!(result.started);
+    let snapshot = operation
+        .snapshot()
+        .expect("operation did not reach a terminal state");
+    assert_eq!(snapshot.outcome, result.outcome);
+
+    // Core safety property the old CancelHandle lacked: the connection reports itself
+    // permanently discarded exactly when the snapshot says a cancellation attempt touched it,
+    // and every further operation on it must then fail instead of silently misbehaving.
+    assert_eq!(conn.is_discarded(), snapshot.connection_discarded);
+    if conn.is_discarded() {
+        assert!(conn.execute("SELECT FIRST 1 1 FROM systables").await.is_err());
+    } else {
+        let _ = conn.execute(&format!("DROP TABLE {tbl}")).await;
+    }
 }

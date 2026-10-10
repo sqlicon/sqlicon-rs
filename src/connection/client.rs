@@ -1,5 +1,6 @@
 //! Asynchronous Informix SQLI Connection.
 
+use crate::connection::cancel::{CancelOperation, CancelOutcome, CancelSnapshot, LC_DISCARDED};
 use crate::connection::capabilities::ServerCapabilities;
 use crate::connection::handshake::*;
 use crate::connection::params::ConnectParams;
@@ -13,7 +14,23 @@ use crate::statement::PreparedStatement;
 use crate::transport::SqliStream;
 use crate::types::column_type::ColumnType;
 use bytes::{BufMut, BytesMut};
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
 use tracing::{debug, info, trace};
+
+/// Local classification of a dispatch outcome, used only to drive
+/// [`Connection::execute_stmt_cancelable`]'s outcome/discard decision -- mirrors the kinds of
+/// `sqli_status` that `sqli_cancel_operation_finish` distinguishes (OK, server error, I/O,
+/// timeout, protocol-with-no-SQLCODE, other).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatusKind {
+    Ok,
+    Server,
+    IoError,
+    Timeout,
+    ProtoError,
+    Other,
+}
 
 /// Connection state matching Informix client lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,7 +145,13 @@ pub struct Connection {
     state: ConnectionState,
     in_transaction: bool,
     autocommit: bool,
+    in_batch: bool,
     last_generated_serial: Option<i64>,
+    /// Shared with any in-flight [`CancelOperation`]: bit `LC_PINNED` while a cancelable
+    /// execute owns this connection, bit `LC_DISCARDED` permanently once a cancellation
+    /// attempt has touched it. Persists for the connection's whole lifetime so a discarded
+    /// connection can never be re-pinned by a later cancel operation.
+    lifecycle: Arc<AtomicU8>,
 }
 
 /// Transaction isolation levels supported by Informix engines.
@@ -350,7 +373,9 @@ impl Connection {
                 state: ConnectionState::Connecting,
                 in_transaction: false,
                 autocommit: true,
+                in_batch: false,
                 last_generated_serial: None,
+                lifecycle: Arc::new(AtomicU8::new(0)),
             };
 
             // First turn for DBOPEN (reads DBOPEN_FLAGS, COMMAND, DONE, COST, etc. up to EOT)
@@ -372,7 +397,9 @@ impl Connection {
             state: ConnectionState::Ready,
             in_transaction: false,
             autocommit: true,
+            in_batch: false,
             last_generated_serial: None,
+            lifecycle: Arc::new(AtomicU8::new(0)),
         })
     }
 
@@ -387,6 +414,23 @@ impl Connection {
     /// did not generate a serial value (e.g. no SERIAL column, or an UPDATE/DELETE).
     pub fn last_generated_serial(&self) -> Option<i64> {
         self.last_generated_serial
+    }
+
+    /// Returns `true` if this connection has been permanently discarded after a cancellation
+    /// attempt via [`execute_stmt_cancelable`](Self::execute_stmt_cancelable). Matches
+    /// `libsqli`'s `SQLI_CONN_DISCARDED` lifecycle bit.
+    pub fn is_discarded(&self) -> bool {
+        self.lifecycle.load(Ordering::SeqCst) & LC_DISCARDED != 0
+    }
+
+    fn ensure_not_discarded(&self) -> Result<()> {
+        if self.is_discarded() {
+            return Err(Error::InvalidState(
+                "connection was discarded after a cancellation attempt and can no longer be used"
+                    .into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Returns the current connection state.
@@ -766,6 +810,7 @@ impl Connection {
     /// # Errors
     /// Returns [`Error::Server`] if syntax error, missing table, or permission denied occurs.
     pub async fn prepare(&mut self, sql: &str) -> Result<PreparedStatement> {
+        self.ensure_not_discarded()?;
         self.drain_pending_turns().await?;
 
         let qmarks = sql.chars().filter(|&c| c == '?').count() as u16;
@@ -856,6 +901,7 @@ impl Connection {
         stmt: &PreparedStatement,
         params: &[crate::statement::ParameterValue],
     ) -> Result<i64> {
+        self.ensure_not_discarded()?;
         let stmt_id = stmt.id();
 
         // 1. If parameters are present, send SQ_ID + SQ_BIND + paramCount + params + SQ_EOT
@@ -898,6 +944,7 @@ impl Connection {
         stmt: &PreparedStatement,
         params: &[crate::statement::ParameterValue],
     ) -> Result<QueryResult> {
+        self.ensure_not_discarded()?;
         let stmt_id = stmt.id();
         let columns = stmt.columns().to_vec();
 
@@ -1165,6 +1212,7 @@ impl Connection {
     /// # Errors
     /// Returns [`Error::InvalidState`] if a transaction is already in progress.
     pub async fn begin(&mut self) -> Result<()> {
+        self.ensure_not_discarded()?;
         if self.in_transaction {
             return Err(Error::InvalidState("Transaction already in progress".into()));
         }
@@ -1187,6 +1235,7 @@ impl Connection {
     /// # Errors
     /// Returns [`Error::InvalidState`] if no transaction is active.
     pub async fn commit(&mut self) -> Result<()> {
+        self.ensure_not_discarded()?;
         if !self.in_transaction {
             return Err(Error::InvalidState("No active transaction to commit".into()));
         }
@@ -1209,6 +1258,7 @@ impl Connection {
     /// # Errors
     /// Returns [`Error::InvalidState`] if no transaction is active.
     pub async fn rollback(&mut self) -> Result<()> {
+        self.ensure_not_discarded()?;
         if !self.in_transaction {
             return Err(Error::InvalidState("No active transaction to roll back".into()));
         }
@@ -1270,6 +1320,7 @@ impl Connection {
     /// matching `libsqli`'s `savepoint_send_core` guard (applied uniformly to all three
     /// savepoint operations): auto-begins when not in autocommit, otherwise errors.
     async fn ensure_savepoint_txn(&mut self) -> Result<()> {
+        self.ensure_not_discarded()?;
         if !self.in_transaction {
             if !self.autocommit {
                 self.begin().await?;
@@ -1355,19 +1406,23 @@ impl Connection {
 
     /// Begins a batch execution block using Informix `SQ_BATCHSTART` (opcode 101).
     pub async fn batch_begin(&mut self) -> Result<()> {
+        self.ensure_not_discarded()?;
         let mut pkt = BytesMut::with_capacity(4);
         pkt.put_u16(Opcode::Batchstart as u16);
         self.stream.write_all(&pkt).await?;
         self.stream.flush().await?;
+        self.in_batch = true;
         Ok(())
     }
 
     /// Ends a batch execution block using Informix `SQ_BATCHEND` (opcode 102).
     pub async fn batch_end(&mut self) -> Result<()> {
+        self.ensure_not_discarded()?;
         let mut pkt = BytesMut::with_capacity(4);
         pkt.put_u16(Opcode::Batchend as u16);
         self.stream.write_all(&pkt).await?;
         self.stream.flush().await?;
+        self.in_batch = false;
         Ok(())
     }
 
@@ -1463,20 +1518,166 @@ impl Connection {
         Ok(BatchResult { items })
     }
 
-    /// Returns a cancellation handle that can asynchronously interrupt in-flight execution on this connection.
-    pub fn cancel_handle(&self) -> CancelHandle {
+    /// Executes a previously prepared `UPDATE`/`DELETE`/`INSERT` with a fresh, single-use
+    /// cancellation capability, matching `libsqli`'s `sqli_execute_cancelable`.
+    ///
+    /// Call [`operation.requester()`](CancelOperation::requester) *before* calling this method
+    /// and hand the resulting [`CancelRequester`] to whichever task or thread should be able to
+    /// interrupt the call -- once this method returns, the operation is terminal and the
+    /// requester can no longer affect anything.
+    ///
+    /// Unlike plain [`execute_stmt`](Self::execute_stmt), this:
+    /// - only supports prepared `UPDATE`/`DELETE`/`INSERT` on a TCP connection (never `SELECT`,
+    ///   batches, LOB streaming, or scalar bindings requiring `WHERE CURRENT OF`);
+    /// - requires an active transaction when autocommit is off (call [`begin`](Self::begin)
+    ///   first);
+    /// - **always discards the connection after any cancellation request is actually sent** --
+    ///   the out-of-band `MSG_OOB` byte can desynchronize the wire even when the DML completes
+    ///   successfully first, so the connection must never be reused afterwards. Every other
+    ///   method on this `Connection` returns `Err(Error::InvalidState)` once that happens.
+    ///
+    /// Returns `Err` only for a precondition failure before the cancel operation was ever
+    /// registered (no SQL was sent in that case). Once registered, this returns `Ok(snapshot)`
+    /// regardless of whether the DML succeeded, was interrupted, or failed -- inspect
+    /// [`CancelSnapshot::outcome`] to tell those apart.
+    pub async fn execute_stmt_cancelable(
+        &mut self,
+        stmt: &PreparedStatement,
+        params: &[crate::statement::ParameterValue],
+        operation: &CancelOperation,
+    ) -> Result<CancelSnapshot> {
+        self.ensure_not_discarded()?;
+
+        const STMT_UPDATE: u16 = 4;
+        const STMT_DELETE: u16 = 5;
+        const STMT_INSERT: u16 = 6;
+        if !matches!(stmt.statement_type(), STMT_UPDATE | STMT_DELETE | STMT_INSERT) {
+            return Err(Error::Unsupported(
+                "cancelable execute only supports prepared UPDATE/DELETE/INSERT".into(),
+            ));
+        }
+        if self.in_batch {
+            return Err(Error::Unsupported(
+                "cancelable execute is not supported inside a batch".into(),
+            ));
+        }
+        if !self.autocommit && !self.in_transaction {
+            return Err(Error::Unsupported(
+                "cancelable execute requires an active transaction when autocommit is off (call begin() first)".into(),
+            ));
+        }
+        if params
+            .iter()
+            .any(|p| matches!(p, crate::statement::ParameterValue::Sblob(_, _)))
+        {
+            return Err(Error::Unsupported(
+                "cancelable execute does not support Smart-LOB parameters".into(),
+            ));
+        }
+        if !self.stream.is_tcp() {
+            return Err(Error::Unsupported(
+                "cancellation is only supported on TCP connections, not onipcstr".into(),
+            ));
+        }
+
         #[cfg(unix)]
-        {
-            CancelHandle {
-                fd: self.stream.raw_fd(),
-            }
-        }
+        let raw_handle = self.stream.raw_fd();
         #[cfg(windows)]
-        {
-            CancelHandle {
-                socket: self.stream.raw_socket(),
+        let raw_handle = self.stream.raw_socket();
+
+        if !operation.register(self.lifecycle.clone(), raw_handle)? {
+            // A cancellation was already requested before registration: no SQL was sent.
+            return Ok(operation.snapshot()?);
+        }
+
+        let stmt_id = stmt.id();
+
+        if !params.is_empty() {
+            let mut bind_pkt = BytesMut::with_capacity(32 + params.len() * 16);
+            bind_pkt.put_u16(Opcode::Id as u16);
+            bind_pkt.put_u16(stmt_id);
+            bind_pkt.put_u16(Opcode::Bind as u16);
+            bind_pkt.put_u16(params.len() as u16);
+            for p in params {
+                if let Err(e) = p.encode_into_with_locale(&mut bind_pkt, Some(&self.params.db_locale)) {
+                    operation.abort_unregistered();
+                    return Err(e);
+                }
+            }
+            bind_pkt.put_u16(Opcode::Eot as u16);
+
+            if let Err(e) = self.stream.write_all(&bind_pkt).await.and(Ok(())) {
+                operation.abort_unregistered();
+                return Err(e);
+            }
+            if let Err(e) = self.stream.flush().await {
+                operation.abort_unregistered();
+                return Err(e);
             }
         }
+
+        let mut exec_pkt = BytesMut::with_capacity(8);
+        exec_pkt.put_u16(Opcode::Id as u16);
+        exec_pkt.put_u16(stmt_id);
+        exec_pkt.put_u16(Opcode::Execute as u16);
+        exec_pkt.put_u16(Opcode::Eot as u16);
+
+        if let Err(e) = self.stream.write_all(&exec_pkt).await {
+            operation.abort_unregistered();
+            return Err(e);
+        }
+        if let Err(e) = self.stream.flush().await {
+            operation.abort_unregistered();
+            return Err(e);
+        }
+
+        // From this point on, a cancel request fires the OOB interrupt immediately. If a
+        // request already latched while we were sending, fire it now.
+        operation.arm();
+
+        let turn_result = self.dispatch_turn(TurnResult::default()).await;
+
+        let (status_ok, sqlcode, kind, message) = match &turn_result {
+            Ok(turn) if turn.saw_done => {
+                self.last_generated_serial = turn.generated_serial;
+                (true, None, StatusKind::Ok, None)
+            }
+            Ok(_) => (
+                false,
+                None,
+                StatusKind::ProtoError,
+                Some("EXECUTE ended without a terminal DONE response".to_string()),
+            ),
+            Err(Error::Server { sqlcode, message, .. }) => {
+                (false, Some(*sqlcode), StatusKind::Server, Some(message.clone()))
+            }
+            Err(Error::Io(io_err)) => {
+                let kind = if io_err.kind() == std::io::ErrorKind::TimedOut {
+                    StatusKind::Timeout
+                } else {
+                    StatusKind::IoError
+                };
+                (false, None, kind, Some(io_err.to_string()))
+            }
+            Err(Error::Protocol(msg)) => (false, None, StatusKind::ProtoError, Some(msg.clone())),
+            Err(e) => (false, None, StatusKind::Other, Some(e.to_string())),
+        };
+
+        // Matches sqli_cancel_operation_finish: once armed, a non-OK result with no server
+        // SQLCODE means we cannot tell whether the DML actually ran, so the connection must be
+        // discarded regardless of whether a cancellation was ever requested.
+        let response_unknown = !status_ok && sqlcode.unwrap_or(0) == 0;
+        let outcome = if status_ok {
+            CancelOutcome::Executed
+        } else if sqlcode == Some(-213) {
+            CancelOutcome::Interrupted
+        } else if response_unknown || matches!(kind, StatusKind::IoError | StatusKind::Timeout) {
+            CancelOutcome::Unknown
+        } else {
+            CancelOutcome::Failed
+        };
+
+        Ok(operation.finish(outcome, response_unknown, message))
     }
 
     /// Opens a Smart Large Object (BLOB / CLOB) by hexadecimal locator string.
