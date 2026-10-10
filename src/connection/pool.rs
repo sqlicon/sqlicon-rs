@@ -4,9 +4,9 @@
 //! safely across concurrent tasks with timeouts, health validation, and automatic reconnection.
 
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::Semaphore;
 
 use crate::connection::client::Connection;
 use crate::connection::params::ConnectParams;
@@ -101,17 +101,19 @@ impl ConnectionPool {
 
         let pool = Self { inner };
 
-        // Warm up minimum idle connections if requested
+        // Warm up minimum idle connections if requested. Matches libsqli's sqli_pool_create:
+        // if any eager warm-up connection fails, pool creation fails outright rather than
+        // silently returning an apparently-healthy pool with fewer (possibly zero) working
+        // connections.
         if pool.inner.options.min_idle > 0 {
             let warmup_count = pool.inner.options.min_idle.min(max_connections);
             for _ in 0..warmup_count {
-                if let Ok(conn) = Connection::connect(pool.inner.params.clone()).await {
-                    let mut q = pool.inner.idle_queue.lock().await;
-                    q.push_back(IdleConnection {
-                        conn,
-                        last_used: Instant::now(),
-                    });
-                }
+                let conn = Connection::connect(pool.inner.params.clone()).await?;
+                let mut q = pool.inner.idle_queue.lock().unwrap();
+                q.push_back(IdleConnection {
+                    conn,
+                    last_used: Instant::now(),
+                });
             }
         }
 
@@ -138,7 +140,7 @@ impl ConnectionPool {
         // Try to pop an existing idle connection
         loop {
             let item_opt = {
-                let mut q = self.inner.idle_queue.lock().await;
+                let mut q = self.inner.idle_queue.lock().unwrap();
                 q.pop_front()
             };
 
@@ -175,7 +177,7 @@ impl ConnectionPool {
 
     /// Returns the number of currently idle connections in the pool.
     pub async fn idle_count(&self) -> usize {
-        let q = self.inner.idle_queue.lock().await;
+        let q = self.inner.idle_queue.lock().unwrap();
         q.len()
     }
 
@@ -208,16 +210,19 @@ impl std::ops::DerefMut for PooledConnection {
 
 impl Drop for PooledConnection {
     fn drop(&mut self) {
+        // The connection must be back in `idle_queue` *before* `_permit` is released
+        // (fields drop in declaration order after this body runs, so `_permit` drops last).
+        // Previously this push was done via a spawned task, which could run after a
+        // concurrent `acquire_internal` had already observed a free permit and an empty
+        // idle_queue, opening a brand-new connection and exceeding `max_connections`. Pushing
+        // back synchronously here (a plain std::sync::Mutex push, no network I/O) closes that
+        // window, matching libsqli's fixed-size slot array, which cannot be over-provisioned.
         if let Some(conn) = self.conn.take() {
             if conn.is_alive() {
-                let pool = self.pool.clone();
-                // Spawn a detached cleanup task to return the connection to the idle queue
-                tokio::spawn(async move {
-                    let mut q = pool.idle_queue.lock().await;
-                    q.push_back(IdleConnection {
-                        conn,
-                        last_used: Instant::now(),
-                    });
+                let mut q = self.pool.idle_queue.lock().unwrap();
+                q.push_back(IdleConnection {
+                    conn,
+                    last_used: Instant::now(),
                 });
             }
         }
