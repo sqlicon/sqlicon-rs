@@ -3427,15 +3427,27 @@ static CODE_TABLE: &[(i32, u32)] = &[
   (32766, 78673)
 ];
 
-static FALLBACK_TABLE: &[(i32, &str)] = &[
-    (-23101, "Unable to load locale categories."),
-    (-23197, "Database locale information mismatch."),
-    (-912, "Network error - Could not write to database server."),
-    (-913, "Network error - Could not read from database server."),
-    (-937, "User Defined Routine error."),
+// Mirrors libsqli's `k_sql_msgs` (sqli_msg_catalog.c): matched against the
+// code exactly, with no sign normalization.
+static SQL_FALLBACK_TABLE: &[(i32, &str)] = &[
+    (-201, "A syntax error has occurred near position: %s."),
+    (-329, "Database (%s) not found or no system permission."),
     (-368, "Incompatible sqlexec module."),
     (-408, "Invalid message type received from the sqlexec process."),
     (-619, "A blob error has occurred in the front-end application."),
+    (-908, "Socket connection to server (%s) failed. Check your server is reachable from this client on the host:port specified."),
+    (-912, "Network error - Could not write to database server."),
+    (-913, "Network error - Could not read from database server."),
+    (-937, "User Defined Routine error."),
+    (-23101, "Unable to load locale categories."),
+    (-23197, "Database locale information mismatch."),
+];
+
+// Mirrors libsqli's `k_isam_msgs` (sqli_msg_catalog.c): matched against
+// `code < 0 ? -code : code` -- i.e. sign-normalized to positive first.
+static ISAM_FALLBACK_TABLE: &[(i32, &str)] = &[
+    (100, "ISAM error:  duplicate value for a record with unique key."),
+    (107, "ISAM error:  record is locked."),
     (111, "ISAM error:  no record found."),
     (126, "ISAM error: bad row id"),
     (143, "ISAM error: deadlock detected"),
@@ -3458,12 +3470,27 @@ pub fn lookup_error_message(code: i32) -> Option<String> {
             return decode_entry(CODE_TABLE[idx].1 as usize);
         }
     }
-    for &(c, msg) in FALLBACK_TABLE {
-        if c == code {
+    if let Some(msg) = sql_fallback_lookup(code) {
+        return Some(msg.to_string());
+    }
+    if code != 0 {
+        if let Some(msg) = isam_fallback_lookup(code) {
             return Some(msg.to_string());
         }
     }
     None
+}
+
+fn sql_fallback_lookup(code: i32) -> Option<&'static str> {
+    SQL_FALLBACK_TABLE.iter().find(|&&(c, _)| c == code).map(|&(_, msg)| msg)
+}
+
+fn isam_fallback_lookup(code: i32) -> Option<&'static str> {
+    let normalized = code.wrapping_abs();
+    ISAM_FALLBACK_TABLE
+        .iter()
+        .find(|&&(c, _)| c == normalized)
+        .map(|&(_, msg)| msg)
 }
 
 fn decode_entry(offset: usize) -> Option<String> {
@@ -3503,4 +3530,28 @@ fn decode_entry(offset: usize) -> Option<String> {
     }
 
     Some(out)
+}
+
+#[cfg(test)]
+mod fallback_tests {
+    use super::*;
+
+    #[test]
+    fn isam_fallback_normalizes_sign_before_matching() {
+        // Mirrors libsqli's sqli_catalog_message_get(): k_isam_msgs is looked
+        // up with `code < 0 ? -code : code`, so both signs must resolve to
+        // the same message.
+        assert_eq!(isam_fallback_lookup(100), isam_fallback_lookup(-100));
+        assert!(isam_fallback_lookup(-100).unwrap().contains("duplicate value"));
+        assert_eq!(isam_fallback_lookup(7353), isam_fallback_lookup(-7353));
+        assert!(isam_fallback_lookup(0).is_none());
+        assert!(isam_fallback_lookup(-999999).is_none());
+    }
+
+    #[test]
+    fn sql_fallback_does_not_normalize_sign() {
+        // k_sql_msgs is matched exactly, with no sign normalization.
+        assert!(sql_fallback_lookup(-23101).is_some());
+        assert!(sql_fallback_lookup(23101).is_none());
+    }
 }
