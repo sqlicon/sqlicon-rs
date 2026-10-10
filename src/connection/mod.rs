@@ -8,6 +8,7 @@ pub mod params;
 pub mod pool;
 pub mod sblob;
 pub mod sqlhosts;
+pub mod transaction;
 
 pub use cancel::{CancelDisposition, CancelOperation, CancelOutcome, CancelRequester, CancelSnapshot};
 pub use capabilities::ServerCapabilities;
@@ -17,3 +18,4 @@ pub use params::{ConnectParams, SslMode};
 pub use pool::{ConnectionPool, PoolOptions, PooledConnection};
 pub use sblob::{SblobHandle, SblobOpenMode, SblobOptions, SblobType, IFX_LO_SPEC_SIZE, SBLOB_LOCATOR_MAX};
 pub use sqlhosts::{find_sqlhosts_entry, parse_sqlhosts, SqlhostsEntry};
+pub use transaction::Transaction;

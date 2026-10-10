@@ -72,7 +72,7 @@ pub mod types;
 pub use connection::{
     BatchItemResult, BatchResult, CancelDisposition, CancelOperation, CancelOutcome,
     CancelRequester, CancelSnapshot, ConnectParams, Connection, ConnectionPool, ConnectionState,
-    IsolationLevel, PoolOptions, PooledConnection, ServerCapabilities, SslMode,
+    IsolationLevel, PoolOptions, PooledConnection, ServerCapabilities, SslMode, Transaction,
 };
 pub use error::{lookup_error_message, Error, Result, Status};
 pub use profile::{Profile, ProfileStore};

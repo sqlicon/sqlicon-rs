@@ -1591,6 +1591,16 @@ impl Connection {
         Ok(())
     }
 
+    /// Starts a transaction and returns a [`Transaction`] scope that must be finished with
+    /// [`Transaction::commit`] or [`Transaction::rollback`] -- a `#[must_use]`-enforced
+    /// alternative to calling [`begin`](Self::begin)/[`commit`](Self::commit)/
+    /// [`rollback`](Self::rollback) directly. See [`Transaction`]'s docs for why dropping it
+    /// unfinished only logs a warning rather than rolling back automatically.
+    pub async fn transaction(&mut self) -> Result<crate::connection::Transaction<'_>> {
+        self.begin().await?;
+        Ok(crate::connection::Transaction::new(self))
+    }
+
     /// Starts a transaction using native `SQ_EOT` + `SQ_BEGIN` (opcode 35).
     ///
     /// # Errors
