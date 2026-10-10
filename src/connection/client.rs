@@ -1427,6 +1427,132 @@ impl Connection {
         Ok(turn)
     }
 
+    /// Sends one positioned fetch (`SQ_SFETCH`) and returns the resulting batch.
+    ///
+    /// Mirrors `libsqli`'s `sqli_send_scroll_fetch` (`sqli_protocol_write.c`):
+    /// `SQ_ID + SQ_SFETCH(direction: u16 BE, index: i32 BE, bufsize: u32 BE) + SQ_EOT`. The
+    /// response is framed identically to an ordinary `SQ_NFETCH` reply (TUPLE/BLOB/DONE/EOT),
+    /// so it's read with the same [`dispatch_turn`](Self::dispatch_turn) used by
+    /// [`fetch_turn`](Self::fetch_turn). `direction` is one of
+    /// [`SFETCH_LAST`]/[`SFETCH_ABSOLUTE`]; `index` is the 1-based target row for `ABSOLUTE`
+    /// and unused (sent as `0`) for `LAST`. Deliberately omits the `SQ_RET_TYPE` variable-
+    /// column preamble C conditionally sends here, consistent with `fetch_turn`/`query_stmt`
+    /// already omitting it for ordinary `SQ_NFETCH` fetches in this port.
+    pub(crate) async fn sfetch_turn(
+        &mut self,
+        stmt_id: u16,
+        columns: &[crate::result::ColumnInfo],
+        direction: u16,
+        index: i32,
+    ) -> Result<TurnResult> {
+        let fetch_bufsize = 32768u32;
+        let mut pkt = BytesMut::with_capacity(20);
+        pkt.put_u16(Opcode::Id as u16);
+        pkt.put_u16(stmt_id);
+        pkt.put_u16(Opcode::Sfetch as u16);
+        pkt.put_u16(direction);
+        pkt.put_i32(index);
+        pkt.put_u32(fetch_bufsize);
+        pkt.put_u16(Opcode::Eot as u16);
+
+        self.stream.write_all(&pkt).await?;
+        self.stream.flush().await?;
+
+        let mut turn = TurnResult::default();
+        turn.columns = columns.to_vec();
+        let mut turn = self.dispatch_turn(turn).await?;
+
+        self.materialize_lob_columns(stmt_id, &mut turn.rows).await?;
+        Ok(turn)
+    }
+
+    /// Opens a cursor for `stmt_id`, optionally marking it scrollable.
+    ///
+    /// Mirrors `libsqli`'s `sqli_send_open` (`sqli_protocol_write.c:156-202`): when
+    /// `scrollable` is set, a bare `SQ_SCROLL` (opcode 24, no payload) is inserted between
+    /// the `SQ_CURNAME` header and `SQ_OPEN`. Cursor holdability across commit (`SQ_HOLD`)
+    /// is out of scope here and never sent.
+    async fn open_cursor(&mut self, stmt_id: u16, scrollable: bool) -> Result<()> {
+        let curname = b"_ifxc000000000000";
+        let mut open_pkt = BytesMut::with_capacity(32);
+        open_pkt.put_u16(Opcode::Id as u16);
+        open_pkt.put_u16(stmt_id);
+        open_pkt.put_u16(Opcode::Curname as u16);
+        open_pkt.put_u16(curname.len() as u16);
+        open_pkt.put_slice(curname);
+        if curname.len() % 2 != 0 {
+            open_pkt.put_u8(0);
+        }
+        if scrollable {
+            open_pkt.put_u16(Opcode::Scroll as u16);
+        }
+        open_pkt.put_u16(Opcode::Open as u16);
+        open_pkt.put_u16(Opcode::Eot as u16);
+
+        self.stream.write_all(&open_pkt).await?;
+        self.stream.flush().await?;
+
+        // Receive OPEN ack turn.
+        let _ = self.dispatch_turn(TurnResult::default()).await?;
+        Ok(())
+    }
+
+    /// Prepares `sql` and opens a scrollable cursor on it, returning a [`ScrollCursor`] for
+    /// positioned navigation (`first`/`last`/`absolute`/`relative`/`previous`/`next`).
+    ///
+    /// Only meaningful for statements that produce result rows; returns
+    /// [`Error::InvalidState`] otherwise (mirroring `libsqli`'s scrollability being gated on
+    /// `statement_type == 2` in `sqli_result_is_server_scrollable`).
+    pub async fn query_scrollable(&mut self, sql: &str) -> Result<crate::result::ScrollCursor<'_>> {
+        let stmt = self.prepare(sql).await?;
+        if !stmt.is_query() {
+            return Err(Error::InvalidState(
+                "query_scrollable requires a statement that produces result rows".into(),
+            ));
+        }
+        let stmt_id = stmt.id();
+        let columns = stmt.columns().to_vec();
+        self.open_cursor(stmt_id, true).await?;
+        Ok(crate::result::ScrollCursor::new(self, stmt_id, columns))
+    }
+
+    /// Like [`query_scrollable`](Self::query_scrollable), but for a previously prepared
+    /// statement with bound parameters.
+    pub async fn query_stmt_scrollable(
+        &mut self,
+        stmt: &PreparedStatement,
+        params: &[crate::statement::ParameterValue],
+    ) -> Result<crate::result::ScrollCursor<'_>> {
+        self.ensure_not_discarded()?;
+        if !stmt.is_query() {
+            return Err(Error::InvalidState(
+                "query_stmt_scrollable requires a statement that produces result rows".into(),
+            ));
+        }
+        let stmt_id = stmt.id();
+        let columns = stmt.columns().to_vec();
+
+        if !params.is_empty() {
+            let mut bind_pkt = BytesMut::with_capacity(32 + params.len() * 16);
+            bind_pkt.put_u16(Opcode::Id as u16);
+            bind_pkt.put_u16(stmt_id);
+            bind_pkt.put_u16(Opcode::Bind as u16);
+            bind_pkt.put_u16(params.len() as u16);
+            for (i, p) in params.iter().enumerate() {
+                p.encode_bind_entry(&mut bind_pkt, Some(&self.params.db_locale), stmt.param_server_type(i))?;
+            }
+            bind_pkt.put_u16(Opcode::Eot as u16);
+
+            self.stream.write_all(&bind_pkt).await?;
+            self.stream.flush().await?;
+
+            self.send_legacy_lob_stream(stmt, params).await?;
+        }
+
+        self.open_cursor(stmt_id, true).await?;
+        Ok(crate::result::ScrollCursor::new(self, stmt_id, columns))
+    }
+
     /// Closes and releases a statement on the server.
     ///
     /// Sends `SQ_ID`, `SQ_CLOSE`, and `SQ_RELEASE` packets to deallocate cursor buffers
