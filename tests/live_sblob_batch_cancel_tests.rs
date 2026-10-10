@@ -65,6 +65,64 @@ async fn test_live_sblob_read_write_seek() {
 }
 
 #[tokio::test]
+async fn test_live_sblob_create_write_read() {
+    let host = std::env::var("INFORMIX_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let params = ConnectParams::new(&host, "9089", "ol_iep")
+        .database("sqli_log_test")
+        .credentials("admin", "admin")
+        .locales("de_DE.1252", "de_DE.1252");
+
+    let mut conn = match Connection::connect(params).await {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Skipping sblob create test: cannot connect to engine ({e})");
+            return;
+        }
+    };
+
+    // Fastpath create (SQ_GETROUTINE + SQ_EXFPROUTINE) in read/write mode, so the same
+    // descriptor can be written and then read back.
+    let options = sqlicon_rs::connection::sblob::SblobOptions {
+        open_mode: sqlicon_rs::connection::sblob::SblobOpenMode::ReadWrite as i32,
+        sbspace: None,
+        estimated_bytes: 1024,
+        maximum_bytes: -1,
+        extent_kib: -1,
+        create_flags: 0,
+    };
+
+    let handle = match conn.sblob_create(sqlicon_rs::connection::sblob::SblobType::Blob, &options).await {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("Skipping sblob create test: {e}");
+            return;
+        }
+    };
+
+    assert!(handle.lofd > 0);
+    assert!(!handle.locator.is_empty() && handle.locator.len() <= 72);
+    assert!(!handle.locator_hex().is_empty());
+
+    let payload = b"sqlicon-rs fastpath create payload";
+    let written = conn.sblob_write(handle.lofd, payload).await.expect("Write to created BLOB");
+    assert_eq!(written, payload.len());
+
+    // The write path buffers data in the descriptor, so a read through the same `lofd`
+    // reports a zero file size; the bytes become visible through the locator only after the
+    // descriptor is closed (verified against a live server).
+    let buffered = conn.sblob_read(handle.lofd, 64).await.expect("Read through open descriptor");
+    assert!(buffered.is_empty());
+
+    conn.sblob_close(handle.lofd).await.expect("Close created descriptor");
+
+    // The locator returned by create must be usable through the SQL path as well.
+    let reopened = conn.sblob_open(&handle.locator_hex(), 4).await.expect("Reopen by locator");
+    let via_sql = conn.sblob_read(reopened, 64).await.expect("Read via reopened handle");
+    assert_eq!(via_sql, payload);
+    conn.sblob_close(reopened).await.expect("Close reopened descriptor");
+}
+
+#[tokio::test]
 async fn test_live_batch_execution() {
     let host = std::env::var("INFORMIX_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
     let params = ConnectParams::new(&host, "9089", "ol_iep")

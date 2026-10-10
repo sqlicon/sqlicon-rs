@@ -15,6 +15,14 @@ pub struct Row {
     pub(crate) columns: Vec<ColumnInfo>,
     pub(crate) col_offsets: Vec<usize>,
     pub(crate) db_locale: Option<String>,
+    /// Materialized legacy BYTE/TEXT column values, indexed by column position. `tuple_data`
+    /// only ever carries the opaque 56-byte LOB locator descriptor for these columns (that's
+    /// what the server puts on the wire in the row's TUPLE data); the actual bytes require a
+    /// separate `SQ_FETCHBLOB` round-trip (`Connection::materialize_lob_columns`), matching
+    /// `libsqli`'s `sqli_fetchblob_materialize`. `None` at an index means materialization
+    /// wasn't performed (e.g. a `Row` built directly in a test, or the column is NULL) --
+    /// `get_raw_column` falls back to the raw locator bytes in that case.
+    pub(crate) materialized_lobs: Vec<Option<Vec<u8>>>,
 }
 
 impl Row {
@@ -28,11 +36,23 @@ impl Row {
         db_locale: Option<String>,
     ) -> Self {
         let col_offsets = Self::calculate_col_offsets(&tuple_data, &columns);
+        let materialized_lobs = vec![None; columns.len()];
         Self {
             tuple_data,
             columns,
             col_offsets,
             db_locale,
+            materialized_lobs,
+        }
+    }
+
+    /// Records the materialized bytes for a legacy BYTE/TEXT column, so subsequent reads
+    /// (`get_raw_column`, `get_string`, `get_display_value`, ...) return the actual data
+    /// instead of the raw LOB locator descriptor. Used by
+    /// [`Connection::materialize_lob_columns`](crate::Connection::materialize_lob_columns).
+    pub(crate) fn set_materialized_lob(&mut self, index: usize, data: Vec<u8>) {
+        if let Some(slot) = self.materialized_lobs.get_mut(index) {
+            *slot = Some(data);
         }
     }
 
@@ -342,11 +362,15 @@ impl Row {
                 }
             }
             ColumnType::Byte | ColumnType::Text => {
-                // Byte / Text locator descriptor: 56 bytes. Null if bit 0 of byte 39 is set
+                // Byte / Text locator descriptor: 56 bytes. Null if bit 0 of byte 39 is set.
                 let len = if col.encoded_length > 0 { col.encoded_length as usize } else { 56 };
                 if base + len <= buf.len() {
                     if len >= 40 && (buf[base + 39] & 0x01) != 0 {
                         Ok(None)
+                    } else if let Some(Some(materialized)) = self.materialized_lobs.get(index) {
+                        // Materialized via a separate SQ_FETCHBLOB round-trip -- the real
+                        // bytes, not the opaque locator (see `materialized_lobs`' doc comment).
+                        Ok(Some(materialized.as_slice()))
                     } else {
                         Ok(Some(&buf[base..base + len]))
                     }
@@ -662,12 +686,20 @@ impl Row {
                 }
             }
             ColumnType::Byte => {
+                // Materialized binary data (see `Row::materialized_lobs`): display as hex,
+                // same convention as the BLOB/CLOB locator fallback above.
                 let mut hex = String::with_capacity(raw.len() * 2);
                 for &b in raw {
                     use std::fmt::Write;
                     let _ = write!(hex, "{:02x}", b);
                 }
                 Ok(hex)
+            }
+            ColumnType::Text => {
+                // Materialized text data: decode via the same DB_LOCALE charset path as
+                // other text columns, not a raw UTF-8/hex dump.
+                let decoded = crate::types::charset::decode_wire_string(raw, self.db_locale.as_deref())?;
+                Ok(decoded.trim_end().to_string())
             }
             _ => {
                 Ok(String::from_utf8_lossy(raw).trim_end().to_string())

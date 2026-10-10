@@ -24,7 +24,8 @@ A pure, asynchronous IBM Informix Dynamic Server client library and CLI written 
   - **Numeric**: `SMALLINT`, `INTEGER`, `BIGINT`, `INT8`, `SERIAL`, `SERIAL8`, `BIGSERIAL`, `FLOAT`, `SMALLFLOAT`, `DECIMAL`, `MONEY`.
   - **Temporal**: `DATE`, `DATETIME` (all qualifiers up to `YEAR TO FRACTION(5)`), `INTERVAL`.
   - **Text & Character**: `CHAR`, `VARCHAR`, `LVARCHAR`, `NCHAR`, `NVARCHAR`, `BOOLEAN`.
-  - **Smart Large Objects (SLOB)**: Complete `BLOB` and `CLOB` support with random-access seeking, chunked reading, and streaming writes (`SQ_LODATA`).
+  - **Smart Large Objects (SLOB)**: Complete `BLOB` and `CLOB` support with random-access seeking, chunked reading, streaming writes (`SQ_LODATA`), and creation via the `ifx_lo_create` fastpath (`SQ_GETROUTINE` + `SQ_EXFPROUTINE`, [`Connection::sblob_create`](src/connection/client.rs)).
+  - **Legacy `BYTE` / `TEXT`**: Parameters bound against a server-declared legacy placeholder are sent as a 56-byte LOB descriptor with the bytes streamed separately (`SQ_BBIND`), and fetched values are materialized through `SQ_FETCHBLOB` while the cursor is open, so row getters return the data rather than the locator.
 - **Full Database Charset & GLS Support**: Automatic conversion between database encoding (`DB_LOCALE` such as `de_DE.1252` / Windows-1252, ISO-8859-1..15, Shift-JIS, GB2312, Big5, etc.) and Rust UTF-8 `String`s.
 - **Prepared Statements & Parameter Binding**: Fast binary parameter encoding (`?` placeholders) and batched execution.
 - **Transactions & Savepoints**: ANSI and Informix transactions (`begin`, `commit`, `rollback`), named savepoints (`savepoint_set`, `savepoint_release`, `savepoint_rollback`), and isolation levels (`CommittedRead`, `RepeatableRead`, `Serializable`, `CursorStability`).

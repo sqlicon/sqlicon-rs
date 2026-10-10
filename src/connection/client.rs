@@ -4,6 +4,9 @@ use crate::connection::cancel::{CancelOperation, CancelOutcome, CancelSnapshot, 
 use crate::connection::capabilities::ServerCapabilities;
 use crate::connection::handshake::*;
 use crate::connection::params::ConnectParams;
+use crate::connection::sblob::{
+    build_ifx_lo_spec, SblobHandle, SblobOptions, SblobType, IFX_LO_SPEC_SIZE, SBLOB_LOCATOR_MAX,
+};
 use crate::error::{Error, Result};
 use crate::protocol::constants::*;
 use crate::protocol::opcodes::Opcode;
@@ -147,6 +150,10 @@ pub struct Connection {
     autocommit: bool,
     in_batch: bool,
     last_generated_serial: Option<i64>,
+    /// Cached `SQ_GETROUTINE` handle for `function informix.ifx_lo_create(...)` plus the
+    /// database name it was resolved for, as in libsqli's `sqli_conn_t` fastpath cache.
+    lo_create_fphandle: i32,
+    lo_create_dbname: String,
     /// Shared with any in-flight [`CancelOperation`]: bit `LC_PINNED` while a cancelable
     /// execute owns this connection, bit `LC_DISCARDED` permanently once a cancellation
     /// attempt has touched it. Persists for the connection's whole lifetime so a discarded
@@ -387,6 +394,8 @@ impl Connection {
                 autocommit: true,
                 in_batch: false,
                 last_generated_serial: None,
+                lo_create_fphandle: 0,
+                lo_create_dbname: String::new(),
                 lifecycle: Arc::new(AtomicU8::new(0)),
             };
 
@@ -411,6 +420,8 @@ impl Connection {
             autocommit: true,
             in_batch: false,
             last_generated_serial: None,
+            lo_create_fphandle: 0,
+            lo_create_dbname: String::new(),
             lifecycle: Arc::new(AtomicU8::new(0)),
         })
     }
@@ -508,6 +519,150 @@ impl Connection {
             let data_len = self.stream.read_u16().await? as usize;
             let pad = if data_len % 2 != 0 { 1 } else { 0 };
             self.stream.drain(data_len + pad).await?;
+        }
+        Ok(())
+    }
+
+    /// Parses a received `SQ_ERR` (opcode 13) payload (already past the opcode itself) into
+    /// an [`Error::Server`], matching the sqlcode-dependent trailing-field layouts `libsqli`'s
+    /// dispatcher handles (`-619`, `-368`, `0`/`-937`/`100`, and the default case), and drains
+    /// the immediately-following `SQ_EOT` if already buffered. Shared by [`dispatch_turn`]'s
+    /// own SQ_ERR case and [`fetchblob_materialize`](Self::fetchblob_materialize)'s response
+    /// loop, which can also receive a server error mid-materialization.
+    async fn read_sq_err(&mut self) -> Result<Error> {
+        let sqlcode = self.stream.read_u16().await? as i16;
+        let isamcode = self.stream.read_u16().await? as i16;
+        let remove64k = self.capabilities.remove_64k_limit;
+        let (sqlstate, message) = if sqlcode == -619 {
+            self.stream.drain(if remove64k { 6 } else { 4 }).await?;
+            let msg = self.read_str().await?;
+            ("".to_string(), msg)
+        } else if sqlcode == -368 {
+            ("".to_string(), "".to_string())
+        } else if sqlcode == 0 || sqlcode == -937 || sqlcode == 100 {
+            let mut st = [0u8; 5];
+            self.stream.read_exact(&mut st).await?;
+            let msg = self.read_str().await?;
+            (String::from_utf8_lossy(&st).to_string(), msg)
+        } else {
+            self.stream.drain(if remove64k { 4 } else { 2 }).await?;
+            let msg = self.read_str().await?;
+            ("".to_string(), msg)
+        };
+
+        if let Some(12) = self.stream.peek_u16(10).await? {
+            let _ = self.stream.read_u16().await?;
+        }
+
+        Ok(Error::Server {
+            sqlcode: sqlcode as i32,
+            isamcode: isamcode as i32,
+            sqlstate,
+            message,
+        })
+    }
+
+    /// Materializes a legacy `BYTE`/`TEXT` column's actual bytes via a dedicated
+    /// `SQ_FETCHBLOB` round-trip, given the raw 56-byte locator descriptor already present
+    /// in the fetched row's tuple data. Matches `libsqli`'s `sqli_fetchblob_materialize`:
+    /// sends `SQ_ID` + `SQ_FETCHBLOB`(38) + the locator bytes (padded if odd) + `SQ_EOT`, then
+    /// reads a response made of `SQ_COST`/`SQ_INFO` (ignored), `SQ_BLOB`(39) chunks and/or
+    /// `SQ_LODATA`(97) chunk groups (both accumulated), and a trailing `SQ_DONE` -- looping
+    /// until `SQ_EOT` ends the exchange. Must be called with the statement/cursor this
+    /// locator came from still open, and before any other message is sent on the connection.
+    async fn fetchblob_materialize(&mut self, stmt_id: u16, locator: &[u8]) -> Result<Vec<u8>> {
+        let mut req = BytesMut::with_capacity(8 + locator.len() + 1);
+        req.put_u16(Opcode::Id as u16);
+        req.put_u16(stmt_id);
+        req.put_u16(Opcode::Fetchblob as u16);
+        req.put_slice(locator);
+        if locator.len() % 2 != 0 {
+            req.put_u8(0);
+        }
+        req.put_u16(Opcode::Eot as u16);
+        self.stream.write_all(&req).await?;
+        self.stream.flush().await?;
+
+        let mut accum: Vec<u8> = Vec::new();
+        loop {
+            let opcode = self.stream.read_u16().await?;
+            match opcode {
+                x if x == Opcode::Cost as u16 => self.handle_cost().await?,
+                x if x == Opcode::Info as u16 => self.drain_info().await?,
+                x if x == Opcode::Blob as u16 => {
+                    let chunk_len = self.stream.read_u16().await? as usize;
+                    let chunk = self.stream.read_bytes(chunk_len).await?;
+                    accum.extend_from_slice(&chunk);
+                    if chunk_len % 2 != 0 {
+                        self.stream.drain(1).await?;
+                    }
+                }
+                97 => {
+                    // SQ_LODATA: op_type(2, ignored) + file_size(4, BE i32) + chunked data
+                    let _op_type = self.stream.read_u16().await?;
+                    let file_size = self.stream.read_u32().await? as i32;
+                    if file_size < 0 {
+                        return Err(Error::Protocol("SQ_LODATA negative file size".into()));
+                    }
+                    let mut remaining = file_size as usize;
+                    while remaining > 0 {
+                        let chunk_len = self.stream.read_u16().await? as usize;
+                        if chunk_len > remaining {
+                            return Err(Error::Protocol("SQ_LODATA chunk exceeds file size".into()));
+                        }
+                        let chunk = self.stream.read_bytes(chunk_len).await?;
+                        accum.extend_from_slice(&chunk);
+                        if chunk_len % 2 != 0 {
+                            self.stream.drain(1).await?;
+                        }
+                        remaining -= chunk_len;
+                    }
+                }
+                x if x == Opcode::Done as u16 => {
+                    self.stream.drain(22).await?;
+                }
+                x if x == Opcode::Eot as u16 => break,
+                x if x == Opcode::Err as u16 => return Err(self.read_sq_err().await?),
+                other => {
+                    return Err(Error::Protocol(format!(
+                        "fetchblob_materialize: unexpected opcode {other}"
+                    )));
+                }
+            }
+        }
+
+        Ok(accum)
+    }
+
+    /// Materializes every non-NULL legacy `BYTE`/`TEXT` column across `rows`, replacing each
+    /// one's effective value (via [`Row::set_materialized_lob`]) with the real data fetched
+    /// through [`fetchblob_materialize`](Self::fetchblob_materialize). A no-op when `columns`
+    /// has no `BYTE`/`TEXT` entries, so ordinary result sets pay no extra round-trips. Must be
+    /// called with `stmt_id`'s cursor/statement still open -- callers should materialize
+    /// before closing a statement whose result set contained legacy LOB columns.
+    async fn materialize_lob_columns(&mut self, stmt_id: u16, rows: &mut [Row]) -> Result<()> {
+        let lob_indices: Vec<usize> = rows
+            .first()
+            .map(|r| {
+                (0..r.column_count())
+                    .filter(|&i| matches!(r.column(i).map(|c| c.col_type), Some(ColumnType::Byte) | Some(ColumnType::Text)))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if lob_indices.is_empty() {
+            return Ok(());
+        }
+
+        for row in rows.iter_mut() {
+            for &idx in &lob_indices {
+                let locator = match row.get_raw_column(idx)? {
+                    Some(bytes) => bytes.to_vec(),
+                    None => continue, // NULL -- nothing to materialize
+                };
+                let data = self.fetchblob_materialize(stmt_id, &locator).await?;
+                row.set_materialized_lob(idx, data);
+            }
         }
         Ok(())
     }
@@ -660,36 +815,7 @@ impl Connection {
                 }
                 13 => {
                     // SQ_ERR
-                    let sqlcode = self.stream.read_u16().await? as i16;
-                    let isamcode = self.stream.read_u16().await? as i16;
-                    let remove64k = self.capabilities.remove_64k_limit;
-                    let (sqlstate, message) = if sqlcode == -619 {
-                        self.stream.drain(if remove64k { 6 } else { 4 }).await?;
-                        let msg = self.read_str().await?;
-                        ("".to_string(), msg)
-                    } else if sqlcode == -368 {
-                        ("".to_string(), "".to_string())
-                    } else if sqlcode == 0 || sqlcode == -937 || sqlcode == 100 {
-                        let mut st = [0u8; 5];
-                        self.stream.read_exact(&mut st).await?;
-                        let msg = self.read_str().await?;
-                        (String::from_utf8_lossy(&st).to_string(), msg)
-                    } else {
-                        self.stream.drain(if remove64k { 4 } else { 2 }).await?;
-                        let msg = self.read_str().await?;
-                        ("".to_string(), msg)
-                    };
-
-                    if let Some(12) = self.stream.peek_u16(10).await? {
-                        let _ = self.stream.read_u16().await?;
-                    }
-
-                    return Err(Error::Server {
-                        sqlcode: sqlcode as i32,
-                        isamcode: isamcode as i32,
-                        sqlstate,
-                        message,
-                    });
+                    return Err(self.read_sq_err().await?);
                 }
                 14 => {
                     // SQ_TUPLE
@@ -1097,6 +1223,7 @@ impl Connection {
             }
         }
 
+        self.materialize_lob_columns(stmt_id, &mut all_rows).await?;
         Ok(QueryResult::new(columns, all_rows, rows_affected, generated_serial, last_warnings))
     }
 
@@ -1178,6 +1305,9 @@ impl Connection {
             }
         }
 
+        // Materialize legacy BYTE/TEXT locators while the cursor is still open (matching
+        // libsqli's `has_lobs` guard that defers `sqli_stmt_close_release`), then close.
+        self.materialize_lob_columns(stmt_id, &mut all_rows).await?;
         self.close_statement(stmt_id).await?;
         Ok(QueryResult::new(columns, all_rows, rows_affected, generated_serial, last_warnings))
     }
@@ -1242,7 +1372,14 @@ impl Connection {
 
         let mut turn = TurnResult::default();
         turn.columns = columns.to_vec();
-        self.dispatch_turn(turn).await
+        let mut turn = self.dispatch_turn(turn).await?;
+
+        // Legacy BYTE/TEXT tuple data carries only the 56-byte locator descriptor. The cursor
+        // is still open at this point, so materialize the actual bytes now — matching libsqli's
+        // `has_lobs` guard in `sqli_query.c`, which deliberately keeps the cursor open for
+        // `sqli_fetchblob_materialize` when the result set contains legacy LOB columns.
+        self.materialize_lob_columns(stmt_id, &mut turn.rows).await?;
+        Ok(turn)
     }
 
     /// Closes and releases a statement on the server.
@@ -1755,6 +1892,247 @@ impl Connection {
         Ok(operation.finish(outcome, response_unknown, message))
     }
 
+    /// Creates a new Smart Large Object (BLOB / CLOB) on the server and returns its handle.
+    ///
+    /// Implements the fastpath path of libsqli's `sqli_sblob_create` (`sblob_create_into`):
+    /// the cached `SQ_GETROUTINE` handle for `function informix.ifx_lo_create( ifx_lo_spec,
+    /// integer,blob)`, then an `SQ_EXFPROUTINE` request carrying the 596-byte `ifx_lo_spec`
+    /// UDT, the open mode and a zero-filled locator, answered by `SQ_FPROUTINE` with the
+    /// locator (output param 0) and the `lofd` descriptor (output param 1). The returned
+    /// handle must be closed with [`sblob_close`](Self::sblob_close).
+    pub async fn sblob_create(
+        &mut self,
+        sblob_type: SblobType,
+        options: &SblobOptions,
+    ) -> Result<SblobHandle> {
+        self.ensure_not_discarded()?;
+        if !self.is_alive() {
+            return Err(Error::InvalidState(
+                "connection is not ready for smartblob create".into(),
+            ));
+        }
+        options.validate()?;
+
+        let (fp_handle, dbname) = self.get_lo_create_fphandle().await?;
+
+        // libsqli drains up to 8 pending tail packets from previous commands before the
+        // fastpath request; `drain_pending_turns` is the async equivalent.
+        self.drain_pending_turns().await?;
+
+        let mode = options.effective_mode();
+        let spec = build_ifx_lo_spec(options);
+
+        let mut req = BytesMut::with_capacity(64 + IFX_LO_SPEC_SIZE + SBLOB_LOCATOR_MAX);
+        req.put_u16(Opcode::Exfproutine as u16);
+        let dblen = dbname.len().min(127);
+        req.put_u16(dblen as u16);
+        req.put_slice(dbname.as_bytes());
+        if (2 + dblen) & 1 != 0 {
+            req.put_u8(0);
+        }
+        req.put_i32(fp_handle);
+        req.put_u16(3); // paramCount
+        req.put_u16(0); // req_fparam
+
+        req.put_u16(Opcode::Bind as u16);
+        req.put_u16(3); // paramCount
+
+        // Param 1: ifx_lo_spec UDT (type 44), payload = BE length + 596 spec bytes.
+        req.put_u16(44);
+        req.put_u16(0); // owner length
+        req.put_u16(11); // table name length
+        req.put_slice(b"ifx_lo_spec");
+        if (2 + 11) & 1 != 0 {
+            req.put_u8(0);
+        }
+        req.put_u16(0); // not null
+        req.put_u16(0); // encoded length
+        req.put_u32(IFX_LO_SPEC_SIZE as u32);
+        req.put_slice(&spec);
+
+        // Param 2: open mode (integer).
+        req.put_u16(2);
+        req.put_u16(0); // not null
+        req.put_u16(0); // encoded length
+        req.put_i32(mode);
+
+        // Param 3: blob UDT, zero-filled locator placeholder.
+        req.put_u16(44);
+        req.put_u16(0); // owner length
+        req.put_u16(4); // table name length
+        req.put_slice(b"blob");
+        req.put_u16(0); // not null
+        req.put_u16(0); // encoded length
+        req.put_u32(SBLOB_LOCATOR_MAX as u32);
+        req.put_slice(&[0u8; SBLOB_LOCATOR_MAX]);
+
+        req.put_u16(Opcode::Eot as u16);
+        self.stream.write_all(&req).await?;
+        self.stream.flush().await?;
+
+        let op = loop {
+            let op = self.stream.read_u16().await?;
+            if op != Opcode::Eot as u16 {
+                break op;
+            }
+        };
+        if op == Opcode::Err as u16 {
+            return Err(self.read_sq_err().await?);
+        }
+        if op != Opcode::Fproutine as u16 {
+            return Err(Error::Protocol(format!(
+                "unexpected opcode {op} in fastpath response (expected SQ_FPROUTINE)"
+            )));
+        }
+
+        let num_params = self.stream.read_u16().await?;
+        let mut created_lofd: i32 = -1;
+        let mut created_locator: Vec<u8> = Vec::new();
+        let mut locator_truncated = false;
+
+        for i in 0..num_params {
+            let raw_type = self.stream.read_u16().await?;
+            let sqltype = raw_type & 0xFF;
+            let is_distinct = (raw_type & 2048) != 0;
+
+            if (sqltype >= 18 && sqltype != 52 && sqltype != 53) || is_distinct {
+                let olen = self.stream.read_u16().await? as usize;
+                if olen > 0 {
+                    self.stream.drain(olen).await?;
+                }
+                if (2 + olen) & 1 != 0 {
+                    self.stream.drain(1).await?;
+                }
+                let nlen = self.stream.read_u16().await? as usize;
+                if nlen > 0 {
+                    self.stream.drain(nlen).await?;
+                }
+                if (2 + nlen) & 1 != 0 {
+                    self.stream.drain(1).await?;
+                }
+            }
+
+            let indicator = self.stream.read_bytes(4).await?;
+            let ind = i16::from_be_bytes([indicator[0], indicator[1]]);
+            if ind == -1 {
+                continue;
+            }
+
+            if matches!(sqltype, 40 | 41 | 44) {
+                let udlen = self.stream.read_u32().await? as usize;
+                let payload = self.stream.read_bytes(udlen).await?;
+                if i == 0 {
+                    if udlen > SBLOB_LOCATOR_MAX {
+                        locator_truncated = true;
+                    } else {
+                        created_locator = payload.to_vec();
+                    }
+                }
+                if udlen & 1 != 0 {
+                    self.stream.drain(1).await?;
+                }
+            } else if matches!(sqltype, 2 | 6) {
+                let int_buf = self.stream.read_bytes(4).await?;
+                let value = i32::from_be_bytes([int_buf[0], int_buf[1], int_buf[2], int_buf[3]]);
+                if i == 1 {
+                    created_lofd = value;
+                }
+            } else {
+                return Err(Error::Protocol(format!(
+                    "unexpected output parameter type {sqltype} in SQ_FPROUTINE response"
+                )));
+            }
+        }
+
+        self.drain_sblob_trailing().await?;
+
+        if locator_truncated {
+            if created_lofd >= 0 {
+                let _ = self.sblob_close(created_lofd).await;
+            }
+            return Err(Error::Protocol(
+                "smart large object locator exceeds maximum buffer length".into(),
+            ));
+        }
+        if created_lofd < 0 || created_locator.is_empty() {
+            if created_lofd >= 0 {
+                let _ = self.sblob_close(created_lofd).await;
+            }
+            return Err(Error::Protocol(
+                "failed to retrieve smart large object descriptor or locator".into(),
+            ));
+        }
+
+        Ok(SblobHandle {
+            lofd: created_lofd,
+            sblob_type,
+            locator: created_locator,
+        })
+    }
+
+    /// Resolves and caches the fastpath routine handle for `informix.ifx_lo_create` via
+    /// `SQ_GETROUTINE`, mirroring libsqli's `sqli_get_lo_create_fphandle`. The handle is
+    /// cached for the connection's lifetime, as in `sqli_conn_t`.
+    async fn get_lo_create_fphandle(&mut self) -> Result<(i32, String)> {
+        if self.lo_create_fphandle > 0 {
+            return Ok((self.lo_create_fphandle, self.lo_create_dbname.clone()));
+        }
+
+        const SIGNATURE: &[u8] = b"function informix.ifx_lo_create( ifx_lo_spec,integer,blob)";
+
+        let mut req = BytesMut::with_capacity(64 + SIGNATURE.len());
+        req.put_u16(Opcode::Getroutine as u16);
+        req.put_u8(0); // flag
+        req.put_u32(SIGNATURE.len() as u32);
+        req.put_slice(SIGNATURE);
+        if (4 + SIGNATURE.len()) & 1 != 0 {
+            req.put_u8(0);
+        }
+        req.put_u16(0); // req_fparam
+        req.put_u16(Opcode::Eot as u16);
+        self.stream.write_all(&req).await?;
+        self.stream.flush().await?;
+
+        let op = loop {
+            let op = Opcode::try_from(self.stream.read_u16().await?)?;
+            match op {
+                Opcode::DbopenFlags => self.stream.drain(2).await?,
+                Opcode::Eot => {}
+                Opcode::Xactstat => self.stream.drain(6).await?,
+                Opcode::Err => return Err(self.read_sq_err().await?),
+                other => break other,
+            }
+        };
+        if op != Opcode::Getroutine {
+            return Err(Error::Protocol(format!(
+                "unexpected opcode {op} in SQ_GETROUTINE response"
+            )));
+        }
+
+        let dblen = self.stream.read_u16().await? as usize;
+        let mut dbname = String::new();
+        if dblen > 0 {
+            let bytes = self.stream.read_bytes(dblen).await?;
+            dbname = String::from_utf8_lossy(&bytes).chars().take(127).collect();
+        }
+        if (2 + dblen) & 1 != 0 {
+            self.stream.drain(1).await?;
+        }
+
+        let handle = self.stream.read_u32().await? as i32;
+        self.drain_sblob_trailing().await?;
+
+        if handle <= 0 {
+            return Err(Error::Protocol(
+                "server returned an invalid routine handle for ifx_lo_create".into(),
+            ));
+        }
+
+        self.lo_create_fphandle = handle;
+        self.lo_create_dbname = dbname.clone();
+        Ok((handle, dbname))
+    }
+
     /// Opens a Smart Large Object (BLOB / CLOB) by hexadecimal locator string.
     ///
     /// Mode values:
@@ -1838,7 +2216,7 @@ impl Connection {
             )));
         }
 
-        // Response body: optype(2), file_size(4)
+        // Response body: optype(2), file_size(4). The read path ignores optype, as libsqli does.
         let _optype = self.stream.read_u16().await?;
         let file_size = self.stream.read_u32().await? as usize;
 
@@ -1983,6 +2361,10 @@ impl Connection {
     }
 
     /// Writes data to an open Smart Large Object using SQ_LODATA (subCom = 2).
+    ///
+    /// The server buffers the bytes in the descriptor until the descriptor is closed: a read
+    /// through the same `lofd` reports a zero file size, and the data only becomes visible
+    /// through the locator after [`sblob_close`](Self::sblob_close).
     pub async fn sblob_write(&mut self, lofd: i32, data: &[u8]) -> Result<usize> {
         if data.is_empty() {
             return Ok(0);
@@ -2077,20 +2459,26 @@ impl Connection {
     /// so this blocks on the read exactly like the rest of this file's dispatch loop does,
     /// rather than racing a fixed timeout that could truncate the drain under latency and
     /// desynchronize the next request.
+    /// Drains the trailer of an SBLOB/fastpath turn until `SQ_EOT`, as every trailing loop in
+    /// libsqli's `sqli_sblob.c` does: `SQ_DONE` carries a 10-byte payload, every other opcode
+    /// is skipped **without consuming payload** — the server terminates a chunk stream with a
+    /// bare opcode-0 marker followed by `SQ_EOT`, so a payload-consuming arm would desync the
+    /// stream and block. Status packets with fixed payloads (`SQ_DBOPEN_FLAGS`, `SQ_XACTSTAT`)
+    /// are only consumed in the fastpath header loop, not here. The loop is bounded so a
+    /// malformed trailer cannot spin forever.
     async fn drain_sblob_trailing(&mut self) -> Result<()> {
-        loop {
-            let next = self.stream.read_u16().await?;
-            if next == Opcode::Eot as u16 {
-                break;
-            } else if next == Opcode::Done as u16 {
-                self.stream.drain(10).await?;
-            } else {
-                return Err(Error::Protocol(format!(
-                    "unexpected opcode {next} while draining SQ_LODATA trailer (expected SQ_DONE/SQ_EOT)"
-                )));
+        for _ in 0..64 {
+            let raw = self.stream.read_u16().await?;
+            match Opcode::try_from(raw) {
+                Ok(Opcode::Eot) => return Ok(()),
+                Ok(Opcode::Done) => self.stream.drain(10).await?,
+                Ok(_) => {}
+                Err(_) => {}
             }
         }
-        Ok(())
+        Err(Error::Protocol(
+            "unbounded SQ_LODATA trailer without SQ_EOT (protocol desync)".into(),
+        ))
     }
 }
 
