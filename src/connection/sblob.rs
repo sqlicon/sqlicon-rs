@@ -33,11 +33,11 @@ pub enum SblobOpenMode {
 
 /// Creation options for [`Connection::sblob_create`](crate::Connection::sblob_create)
 /// (`sqli_sblob_options` in `libsqli`). All size fields use `-1` for "unset"; `open_mode`
-/// `0` selects the default write-only mode.
+/// `None` selects the default write-only mode.
 #[derive(Debug, Clone)]
 pub struct SblobOptions {
-    /// Open mode; `0` = default (`WriteOnly`). Must be `0..=0xFFFF`.
-    pub open_mode: i32,
+    /// Open mode; `None` selects the default (`WriteOnly`), matching `libsqli`'s `0`.
+    pub open_mode: Option<SblobOpenMode>,
     /// Storage space name; at most 127 characters.
     pub sbspace: Option<String>,
     /// Estimated size in bytes (`-1` = unset).
@@ -53,7 +53,7 @@ pub struct SblobOptions {
 impl Default for SblobOptions {
     fn default() -> Self {
         Self {
-            open_mode: 0,
+            open_mode: None,
             sbspace: None,
             estimated_bytes: -1,
             maximum_bytes: -1,
@@ -65,13 +65,9 @@ impl Default for SblobOptions {
 
 impl SblobOptions {
     /// Validates the option values exactly as `sqli_sblob_create` does, returning
-    /// [`Error::InvalidArgument`] for each rejected field.
+    /// [`Error::InvalidArgument`] for each rejected field. `open_mode` needs no range
+    /// check here: as an `Option<SblobOpenMode>` it cannot hold an invalid value.
     pub fn validate(&self) -> Result<()> {
-        if self.open_mode < 0 || self.open_mode > 0xFFFF {
-            return Err(Error::InvalidArgument(
-                "invalid open_mode in smartblob options".into(),
-            ));
-        }
         if let Some(sbspace) = &self.sbspace {
             if sbspace.len() >= 128 {
                 return Err(Error::InvalidArgument(
@@ -87,13 +83,9 @@ impl SblobOptions {
         Ok(())
     }
 
-    /// Effective open mode: `0` maps to the default `WriteOnly` (2), as in `libsqli`.
-    pub fn effective_mode(&self) -> i32 {
-        if self.open_mode == 0 {
-            SblobOpenMode::WriteOnly as i32
-        } else {
-            self.open_mode
-        }
+    /// Effective open mode: `None` maps to the default `WriteOnly`, as in `libsqli`.
+    pub fn effective_mode(&self) -> SblobOpenMode {
+        self.open_mode.unwrap_or(SblobOpenMode::WriteOnly)
     }
 }
 
@@ -206,7 +198,7 @@ mod tests {
     #[test]
     fn ifx_lo_spec_option_values() {
         let opts = SblobOptions {
-            open_mode: 4,
+            open_mode: Some(SblobOpenMode::ReadOnly),
             sbspace: Some("bspace1".to_string()),
             estimated_bytes: 1000,
             maximum_bytes: 0x1_0000_0000,
@@ -214,7 +206,7 @@ mod tests {
             create_flags: 0x1234_5678,
         };
         opts.validate().unwrap();
-        assert_eq!(opts.effective_mode(), 4);
+        assert_eq!(opts.effective_mode(), SblobOpenMode::ReadOnly);
 
         let spec = build_ifx_lo_spec(&opts);
         assert_eq!(&spec[4..8], &[0x12, 0x34, 0x56, 0x78]);
@@ -229,10 +221,8 @@ mod tests {
 
     #[test]
     fn option_validation_rejects_out_of_range_values() {
-        let mut opts = SblobOptions::default();
-        opts.open_mode = 0x1_0000;
-        assert!(matches!(opts.validate(), Err(Error::InvalidArgument(_))));
-
+        // open_mode has no out-of-range case anymore: Option<SblobOpenMode> cannot
+        // represent an invalid value, so there's nothing left to reject here.
         let mut opts = SblobOptions::default();
         opts.sbspace = Some("x".repeat(128));
         assert!(matches!(opts.validate(), Err(Error::InvalidArgument(_))));
@@ -242,6 +232,6 @@ mod tests {
         assert!(matches!(opts.validate(), Err(Error::InvalidArgument(_))));
 
         assert!(SblobOptions::default().validate().is_ok());
-        assert_eq!(SblobOptions::default().effective_mode(), 2);
+        assert_eq!(SblobOptions::default().effective_mode(), SblobOpenMode::WriteOnly);
     }
 }

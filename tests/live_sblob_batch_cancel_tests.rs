@@ -1,5 +1,6 @@
 //! Live test suite for Smart Large Objects (BLOB / CLOB), Batch Execution, and Query Cancellation.
 
+use sqlicon_rs::connection::sblob::SblobOpenMode;
 use sqlicon_rs::{
     ConnectParams, Connection, ParameterValue,
 };
@@ -42,7 +43,7 @@ async fn test_live_sblob_read_write_seek() {
     assert!(!hex_c.is_empty());
 
     // 1. Open BLOB for read
-    let lofd = conn.sblob_open(&hex_b, 4).await.expect("Open BLOB read-only");
+    let lofd = conn.sblob_open(&hex_b, SblobOpenMode::ReadOnly).await.expect("Open BLOB read-only");
     assert!(lofd > 0);
 
     // Read first 20 bytes
@@ -57,7 +58,7 @@ async fn test_live_sblob_read_write_seek() {
     conn.sblob_close(lofd).await.expect("Close BLOB descriptor");
 
     // 2. Convenience direct read for CLOB
-    let clob_data = conn.read_sblob(&hex_c, 50).await.expect("Convenience read CLOB");
+    let clob_data = conn.sblob_read_by_locator(&hex_c, 50).await.expect("Convenience read CLOB");
     assert_eq!(clob_data.len(), 50);
 
     // Cleanup
@@ -83,7 +84,7 @@ async fn test_live_sblob_create_write_read() {
     // Fastpath create (SQ_GETROUTINE + SQ_EXFPROUTINE) in read/write mode, so the same
     // descriptor can be written and then read back.
     let options = sqlicon_rs::connection::sblob::SblobOptions {
-        open_mode: sqlicon_rs::connection::sblob::SblobOpenMode::ReadWrite as i32,
+        open_mode: Some(SblobOpenMode::ReadWrite),
         sbspace: None,
         estimated_bytes: 1024,
         maximum_bytes: -1,
@@ -116,7 +117,7 @@ async fn test_live_sblob_create_write_read() {
     conn.sblob_close(handle.lofd).await.expect("Close created descriptor");
 
     // The locator returned by create must be usable through the SQL path as well.
-    let reopened = conn.sblob_open(&handle.locator_hex(), 4).await.expect("Reopen by locator");
+    let reopened = conn.sblob_open(&handle.locator_hex(), SblobOpenMode::ReadOnly).await.expect("Reopen by locator");
     let via_sql = conn.sblob_read(reopened, 64).await.expect("Read via reopened handle");
     assert_eq!(via_sql, payload);
     conn.sblob_close(reopened).await.expect("Close reopened descriptor");

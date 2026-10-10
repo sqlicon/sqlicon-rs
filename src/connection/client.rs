@@ -5,7 +5,7 @@ use crate::connection::capabilities::ServerCapabilities;
 use crate::connection::handshake::*;
 use crate::connection::params::ConnectParams;
 use crate::connection::sblob::{
-    build_ifx_lo_spec, SblobHandle, SblobOptions, SblobType, IFX_LO_SPEC_SIZE, SBLOB_LOCATOR_MAX,
+    build_ifx_lo_spec, SblobHandle, SblobOpenMode, SblobOptions, SblobType, IFX_LO_SPEC_SIZE, SBLOB_LOCATOR_MAX,
 };
 use crate::error::{Error, Result};
 use crate::protocol::constants::*;
@@ -2090,7 +2090,7 @@ impl Connection {
         // fastpath request; `drain_pending_turns` is the async equivalent.
         self.drain_pending_turns().await?;
 
-        let mode = options.effective_mode();
+        let mode = options.effective_mode() as i32;
         let spec = build_ifx_lo_spec(options);
 
         let mut req = BytesMut::with_capacity(64 + IFX_LO_SPEC_SIZE + SBLOB_LOCATOR_MAX);
@@ -2305,14 +2305,9 @@ impl Connection {
     }
 
     /// Opens a Smart Large Object (BLOB / CLOB) by hexadecimal locator string.
-    ///
-    /// Mode values:
-    /// - 1: Append
-    /// - 2: Write-only
-    /// - 4: Read-only
-    /// - 8: Read/Write
-    pub async fn sblob_open(&mut self, locator_hex: &str, mode: i32) -> Result<i32> {
-        let sql = format!("SELECT ifx_lo_open('{locator_hex}'::BLOB, {mode}) FROM sysmaster:sysdual");
+    pub async fn sblob_open(&mut self, locator_hex: &str, mode: SblobOpenMode) -> Result<i32> {
+        let mode_code = mode as i32;
+        let sql = format!("SELECT ifx_lo_open('{locator_hex}'::BLOB, {mode_code}) FROM sysmaster:sysdual");
         let res = self.query(&sql).await?;
         if res.rows.is_empty() {
             return Err(Error::Server {
@@ -2616,9 +2611,12 @@ impl Connection {
         Ok(data.len())
     }
 
-    /// Convenience method to read Smart-LOB content directly given a hex locator.
-    pub async fn read_sblob(&mut self, locator_hex: &str, max_bytes: usize) -> Result<Vec<u8>> {
-        let lofd = self.sblob_open(locator_hex, 4).await?;
+    /// Convenience method to read Smart-LOB content directly given a hex locator: opens,
+    /// reads, and closes the descriptor in one call. Named to match the rest of the
+    /// `sblob_*` family (`sblob_open`/`sblob_close`/`sblob_read`/`sblob_write`/
+    /// `sblob_create`) instead of standing out as `read_sblob`.
+    pub async fn sblob_read_by_locator(&mut self, locator_hex: &str, max_bytes: usize) -> Result<Vec<u8>> {
+        let lofd = self.sblob_open(locator_hex, SblobOpenMode::ReadOnly).await?;
         let res = self.sblob_read(lofd, max_bytes).await;
         let _ = self.sblob_close(lofd).await;
         res
