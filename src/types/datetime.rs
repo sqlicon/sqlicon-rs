@@ -459,22 +459,47 @@ impl std::fmt::Display for DateTime {
         if self.is_null {
             return write!(f, "NULL");
         }
-        if self.hour == 0 && self.minute == 0 && self.second == 0 && self.nanosecond == 0 {
-            write!(f, "{:04}-{:02}-{:02}", self.year, self.month, self.day)
-        } else if self.nanosecond > 0 {
-            let millis = self.nanosecond / 1_000_000;
-            write!(
-                f,
-                "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
-                self.year, self.month, self.day, self.hour, self.minute, self.second, millis
-            )
-        } else {
-            write!(
-                f,
-                "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-                self.year, self.month, self.day, self.hour, self.minute, self.second
-            )
+
+        let first = self.range.first as u8;
+        let last = self.range.last as u8;
+        // Matches libsqli's complete_timestamp(): a full YEAR..SECOND-or-finer
+        // range separates date and time with 'T' instead of a space.
+        let complete = self.range.first == TemporalField::Year && self.range.last >= TemporalField::Second;
+
+        for field_idx in first..=last {
+            if field_idx != first || field_idx == TemporalField::Fraction as u8 {
+                let sep = match field_idx {
+                    2 | 3 => '-',                          // Month, Day
+                    4 => {
+                        if complete {
+                            'T'
+                        } else {
+                            ' '
+                        }
+                    } // Hour
+                    5 | 6 => ':', // Minute, Second
+                    _ => '.',     // Fraction
+                };
+                write!(f, "{sep}")?;
+            }
+
+            match field_idx {
+                1 => write!(f, "{:04}", self.year)?,
+                2 => write!(f, "{:02}", self.month)?,
+                3 => write!(f, "{:02}", self.day)?,
+                4 => write!(f, "{:02}", self.hour)?,
+                5 => write!(f, "{:02}", self.minute)?,
+                6 => write!(f, "{:02}", self.second)?,
+                7 => {
+                    let width = self.range.fractional_digits as usize;
+                    let factor = power10(9 - (self.range.fractional_digits as u32));
+                    let frac = self.nanosecond / factor;
+                    write!(f, "{:0width$}", frac, width = width)?;
+                }
+                _ => {}
+            }
         }
+        Ok(())
     }
 }
 

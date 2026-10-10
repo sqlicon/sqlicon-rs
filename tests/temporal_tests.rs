@@ -1,7 +1,7 @@
 use sqlicon_rs::types::date::{date_decode_wire, date_encode_wire, Date};
 use sqlicon_rs::types::datetime::{
     datetime_decode_wire, datetime_encode_wire, interval_decode_wire,
-    interval_encode_wire, temporal_wire_size,
+    interval_encode_wire, temporal_wire_size, DateTime, TemporalField, TemporalRange,
 };
 
 #[test]
@@ -176,11 +176,12 @@ fn test_all_temporal_qualifiers() {
 
 #[test]
 fn test_datetime_and_interval_fixtures() {
-    // Full datetime: 2026-06-20 12:34:56
+    // Full datetime (YEAR TO SECOND): libsqli's complete_timestamp() formats
+    // this with a 'T' separator, not a space -- see test_native_temporal_linux.c:94.
     let full_qual = 0x0e0a;
     let full_bytes = [0xc7, 20, 26, 6, 20, 12, 34, 56];
     let dt = datetime_decode_wire(&full_bytes, full_qual).expect("decode datetime");
-    assert_eq!(dt.to_string(), "2026-06-20 12:34:56");
+    assert_eq!(dt.to_string(), "2026-06-20T12:34:56");
 
     let mut out = [0u8; 8];
     let len = datetime_encode_wire(&dt, full_qual, &mut out).expect("encode datetime");
@@ -197,4 +198,52 @@ fn test_datetime_and_interval_fixtures() {
     let len = interval_encode_wire(&it, int_qual, &mut int_out).expect("encode interval");
     assert_eq!(len, 4);
     assert_eq!(int_out, int_bytes);
+}
+
+#[test]
+fn test_datetime_display_is_range_aware() {
+    // HOUR TO SECOND: a partial range must not print a bogus date prefix,
+    // and the first field (Hour) carries no separator.
+    let hour_to_second_qual = 0x066a;
+    let value = DateTime {
+        range: TemporalRange {
+            first: TemporalField::Hour,
+            last: TemporalField::Second,
+            fractional_digits: 0,
+        },
+        year: 0,
+        month: 0,
+        day: 0,
+        hour: 12,
+        minute: 34,
+        second: 56,
+        nanosecond: 0,
+        is_null: false,
+    };
+    let mut buf = [0u8; 4];
+    let len = datetime_encode_wire(&value, hour_to_second_qual, &mut buf).expect("encode");
+    let decoded = datetime_decode_wire(&buf[..len], hour_to_second_qual).expect("decode");
+    assert_eq!(decoded.to_string(), "12:34:56");
+
+    // YEAR TO FRACTION(3): a complete timestamp uses 'T' between date and time.
+    let full_fraction_qual = 0x110d;
+    let value = DateTime {
+        range: TemporalRange {
+            first: TemporalField::Year,
+            last: TemporalField::Fraction,
+            fractional_digits: 3,
+        },
+        year: 2026,
+        month: 6,
+        day: 20,
+        hour: 12,
+        minute: 34,
+        second: 56,
+        nanosecond: 120_000_000,
+        is_null: false,
+    };
+    let mut buf = [0u8; 10];
+    let len = datetime_encode_wire(&value, full_fraction_qual, &mut buf).expect("encode");
+    let decoded = datetime_decode_wire(&buf[..len], full_fraction_qual).expect("decode");
+    assert_eq!(decoded.to_string(), "2026-06-20T12:34:56.120");
 }

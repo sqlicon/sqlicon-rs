@@ -175,7 +175,10 @@ fn test_all_native_wire_fixtures_from_c() {
             qualifier: 0x0e0a,
             wire: &[0xc7, 20, 26, 6, 20, 12, 34, 56],
             wire_length: 8,
-            text: "2026-06-20 12:34:56",
+            // A complete YEAR TO SECOND timestamp separates date and time
+            // with 'T', matching libsqli's complete_timestamp() formatting
+            // (see test_native_temporal_linux.c:94 in the C test suite).
+            text: "2026-06-20T12:34:56",
             is_null: false,
         },
         WireFixture {
@@ -184,7 +187,9 @@ fn test_all_native_wire_fixtures_from_c() {
             qualifier: 0x0400,
             wire: &[0xc6, 1, 0],
             wire_length: 3,
-            text: "0001-00-00",
+            // YEAR TO YEAR: only the year field is in range, so no
+            // month/day placeholder is printed.
+            text: "0001",
             is_null: false,
         },
         WireFixture {
