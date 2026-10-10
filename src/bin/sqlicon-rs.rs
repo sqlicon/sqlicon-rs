@@ -244,6 +244,15 @@ fn build_connect_params(args: &CliArgs, store: &ProfileStore) -> Result<ConnectP
         .or_else(|| env::var("SQLI_PASSWORD").ok())
         .or_else(|| prof.and_then(|p| p.password.clone()));
 
+    if password.is_none() {
+        if let Some(err) = prof.and_then(|p| p.password_decrypt_error.as_ref()) {
+            return Err(format!(
+                "Stored profile password could not be decrypted: {err} \
+                 (pass --password or SQLI_PASSWORD to override)"
+            ));
+        }
+    }
+
     let client_locale = args
         .client_locale
         .clone()

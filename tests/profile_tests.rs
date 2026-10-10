@@ -69,3 +69,37 @@ fn test_profile_to_connect_params() {
     assert_eq!(params.client_locale, "de_DE.utf8");
     assert_eq!(params.db_locale, "de_DE.1252");
 }
+
+#[test]
+fn test_profile_corrupt_encrypted_secret_surfaces_error_not_silent_none() {
+    let temp_dir = std::env::temp_dir().join(format!("sqlicon_test_corrupt_{}", std::process::id()));
+    fs::create_dir_all(&temp_dir).unwrap();
+    let config_file = temp_dir.join("profiles.conf");
+
+    // A profile whose password_enc value is garbage (as if the profile were
+    // copied to a machine with a different /etc/machine-id, or the file was
+    // corrupted). This must NOT be silently treated as "no password stored".
+    let contents = "version=2\n\
+kdf_method=uuid_uid_v1\n\
+default=broken\n\
+profile.broken.host=127.0.0.1\n\
+profile.broken.server=ol_test\n\
+profile.broken.user=informix\n\
+profile.broken.password_enc=not-valid-base64-ciphertext\n";
+    fs::write(&config_file, contents).unwrap();
+
+    let loaded = ProfileStore::load_from_path(&config_file).expect("load should still succeed");
+    let prof = loaded.get("broken").expect("profile not found");
+
+    assert!(prof.password.is_none());
+    assert!(
+        prof.password_decrypt_error.is_some(),
+        "decrypt failure must be surfaced, not silently swallowed"
+    );
+
+    // to_connect_params() must error instead of silently connecting with an
+    // empty/missing password.
+    assert!(prof.to_connect_params().is_err());
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}

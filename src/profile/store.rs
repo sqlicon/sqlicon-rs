@@ -18,6 +18,10 @@ pub struct Profile {
     pub password: Option<String>,
     pub client_locale: Option<String>,
     pub db_locale: Option<String>,
+    /// Set when a stored `password_enc` field could not be decrypted (e.g.
+    /// the profile was copied to another machine, or the key material
+    /// changed). Distinguishes "decrypt failed" from "no password stored".
+    pub password_decrypt_error: Option<String>,
 }
 
 impl Profile {
@@ -40,6 +44,14 @@ impl Profile {
             params = params.database(db);
         }
         if let Some(ref user) = self.user {
+            if self.password.is_none() {
+                if let Some(ref err) = self.password_decrypt_error {
+                    return Err(Error::Authentication(format!(
+                        "Profile '{}' has a stored password that could not be decrypted: {err}",
+                        self.name
+                    )));
+                }
+            }
             let pass = self.password.as_deref().unwrap_or("");
             params = params.credentials(user, pass);
         }
@@ -141,9 +153,13 @@ impl ProfileStore {
                     "password" => profile.password = Some(value.to_string()),
                     "password_enc" => {
                         if version >= 2 && !kdf_method.is_empty() && kdf_method != "uuid_uid_v1" {
-                            // unsupported kdf
-                        } else if let Ok(plain) = decrypt_profile_secret(value) {
-                            profile.password = Some(plain);
+                            profile.password_decrypt_error =
+                                Some(format!("unsupported key-derivation method '{kdf_method}'"));
+                        } else {
+                            match decrypt_profile_secret(value) {
+                                Ok(plain) => profile.password = Some(plain),
+                                Err(e) => profile.password_decrypt_error = Some(e.to_string()),
+                            }
                         }
                     }
                     "client_locale" => profile.client_locale = Some(value.to_string()),
