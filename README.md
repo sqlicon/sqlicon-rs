@@ -29,6 +29,7 @@ A pure, asynchronous IBM Informix Dynamic Server client library and CLI written 
 - **Prepared Statements & Parameter Binding**: Fast binary parameter encoding (`?` placeholders) and batched execution.
 - **Transactions & Savepoints**: ANSI and Informix transactions (`begin`, `commit`, `rollback`), named savepoints (`savepoint_set`, `savepoint_release`, `savepoint_rollback`), and isolation levels (`CommittedRead`, `RepeatableRead`, `Serializable`, `CursorStability`).
 - **Out-of-Band Cancellation**: Single-use `CancelOperation`/`CancelRequester` scoped to one prepared `UPDATE`/`DELETE`/`INSERT`, using TCP urgent out-of-band interrupts (`MSG_OOB` via POSIX `send` on Unix and Winsock `send` on Windows) to abort it on the server (`SQLCODE -213`). The connection is always discarded after a cancellation attempt.
+- **`sqlhosts` File Resolution**: Parse an Informix `sqlhosts` file and resolve a `dbservername` to its `protocol`/`hostname`/`service` via [`ConnectParams::from_sqlhosts`](src/connection/params.rs) or the standalone [`connection::sqlhosts`](src/connection/sqlhosts.rs) parser/lookup functions, mirroring libsqli's `sqli_parse_sqlhosts`/`sqli_find_sqlhosts_entry`.
 - **Offline Error Catalog**: Full embedded 3,412-error Informix message catalog with dictionary expansion matching IBM Informix `finderr`.
 - **Encrypted Profile Store**: Built-in CLI profile manager with AES-256-GCM encryption tied to machine-specific hardware IDs (`/etc/machine-id` on Linux, `MachineGuid` on Windows).
 

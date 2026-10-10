@@ -87,6 +87,38 @@ impl ConnectParams {
         self
     }
 
+    /// Resolves `server_name` via an Informix `sqlhosts` file (see [`crate::connection::sqlhosts`])
+    /// and builds `ConnectParams` from the matching entry's `protocol`/`hostname`/`service`
+    /// fields. `filepath` is passed straight to [`crate::connection::sqlhosts::parse_sqlhosts`]
+    /// (`None` uses `$INFORMIXDIR/etc/sqlhosts` or `/etc/sqlhosts`).
+    ///
+    /// Unlike libsqli (where sqlhosts parsing is a standalone utility the caller wires up
+    /// manually), this is sqlicon-rs's convenience wrapper combining the parse+lookup with
+    /// building a usable `ConnectParams` in one call. Returns
+    /// [`crate::error::Error::InvalidArgument`] if no entry matches `server_name`.
+    pub fn from_sqlhosts(server_name: &str, filepath: Option<&str>) -> crate::error::Result<Self> {
+        let entry = crate::connection::sqlhosts::lookup(filepath, server_name)?.ok_or_else(|| {
+            crate::error::Error::InvalidArgument(format!(
+                "sqlhosts: no entry found for server '{server_name}'"
+            ))
+        })?;
+
+        let protocol = entry.protocol.to_ascii_lowercase();
+        let (hostname, service) = if protocol == "onipcstr" {
+            (String::new(), entry.service.clone())
+        } else {
+            (entry.hostname.clone(), entry.service.clone())
+        };
+
+        Ok(Self {
+            hostname,
+            service,
+            server: entry.server_name.clone(),
+            ssl_enable: protocol == "onsocssl",
+            ..Default::default()
+        })
+    }
+
     /// Parse connection parameters from an Informix connection URI:
     /// e.g. `informix+onsoctcp://user:pass@host:port/dbname?INFORMIXSERVER=server&DB_LOCALE=de_DE.1252`
     pub fn from_uri(uri: &str) -> crate::error::Result<Self> {
