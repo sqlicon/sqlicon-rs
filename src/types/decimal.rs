@@ -127,7 +127,8 @@ impl Decimal {
             return 1;
         }
         let mut digits = (self.limbs.len() - 1) * DECIMAL_LIMB_DIGITS;
-        let mut top = *self.limbs.last().unwrap();
+        // `limbs` is non-empty here: the empty case returned above.
+        let mut top = *self.limbs.last().expect("limbs is non-empty, checked above");
         while top > 0 {
             digits += 1;
             top /= 10;

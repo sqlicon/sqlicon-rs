@@ -145,6 +145,19 @@ impl Default for Inner {
     }
 }
 
+/// Locks `inner`, recovering from poisoning rather than propagating the panic.
+///
+/// A poisoned lock here would mean some other task panicked while holding it; every
+/// critical section under this lock is a handful of panic-free field assignments (no
+/// indexing, no further locking, no I/O), so poisoning should not happen in practice. If it
+/// ever does, recovering the state is still safe for this type's one safety-critical
+/// invariant: the connection-discarded bit is only ever set (`fetch_or`), never cleared, so
+/// a recovered (possibly stale) `Inner` cannot cause an already-discarded connection to
+/// look safe to reuse.
+fn lock_inner(inner: &Mutex<Inner>) -> std::sync::MutexGuard<'_, Inner> {
+    inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn send_interrupt_locked(inner: &mut Inner) {
     if let Some(reg) = &inner.registered {
         // Once an urgent-send attempt is made, the connection is discarded unconditionally,
@@ -191,7 +204,7 @@ impl CancelOperation {
     /// Returns the terminal snapshot once the bound call has completed.
     /// Returns `Err(Error::InvalidState)` if the call hasn't finished yet.
     pub fn snapshot(&self) -> Result<CancelSnapshot> {
-        let inner = self.inner.lock().unwrap();
+        let inner = lock_inner(&self.inner);
         if inner.state != OpState::Terminal {
             return Err(Error::InvalidState(
                 "cancel operation has not completed yet".into(),
@@ -206,7 +219,7 @@ impl CancelOperation {
     /// `Ok(false)` if a cancellation was already latched before registration (the call must
     /// not send anything and is already terminal with `CancelOutcome::NotExecuted`).
     pub(crate) fn register(&self, lifecycle: Arc<AtomicU8>, handle: RawIoHandle) -> Result<bool> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = lock_inner(&self.inner);
         if inner.state != OpState::Fresh {
             return Err(Error::InvalidState(
                 "cancel operation was already used for a previous call".into(),
@@ -238,7 +251,7 @@ impl CancelOperation {
     /// itself failed before the EXECUTE group was ever completed, so no ambiguous in-flight DML
     /// exists on the wire and the connection can be safely reused.
     pub(crate) fn abort_unregistered(&self) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = lock_inner(&self.inner);
         if let Some(reg) = inner.registered.take() {
             reg.lifecycle.fetch_and(!LC_PINNED, Ordering::SeqCst);
         }
@@ -249,7 +262,7 @@ impl CancelOperation {
     /// the full EXECUTE group has been flushed to the socket, matching
     /// `sqli_cancel_operation_arm`.
     pub(crate) fn arm(&self) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = lock_inner(&self.inner);
         if inner.state != OpState::Active || inner.armed {
             return;
         }
@@ -269,7 +282,7 @@ impl CancelOperation {
         discard: bool,
         operation_error: Option<String>,
     ) -> CancelSnapshot {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = lock_inner(&self.inner);
         let Some(reg) = inner.registered.take() else {
             return inner.snapshot.clone();
         };
@@ -299,7 +312,7 @@ impl CancelRequester {
     /// actually stopped -- always inspect the operation's terminal snapshot afterwards.
     /// Repeated requests send no further urgent bytes.
     pub fn request(&self) -> CancelDisposition {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = lock_inner(&self.inner);
         if inner.state == OpState::Terminal {
             return CancelDisposition::Completed;
         }

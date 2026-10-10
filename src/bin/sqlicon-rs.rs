@@ -1405,11 +1405,12 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     std::thread::Builder::new()
         .stack_size(4 * 1024 * 1024)
         .spawn(|| {
+            // Building the runtime can legitimately fail at runtime (resource exhaustion),
+            // so propagate it like any other startup error instead of panicking.
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .thread_stack_size(4 * 1024 * 1024)
-                .build()
-                .expect("failed to build tokio runtime");
+                .build()?;
             rt.block_on(async_main())
         })?
         .join()

@@ -106,8 +106,10 @@ impl ParameterValue {
 
         // Wire type is always the server-declared type here, matching `wire_type =
         // is_legacy_lob ? server_type : par->type` in build_bind_msg -- even for a value
-        // that ultimately encodes an empty/zero-length descriptor below.
-        buf.put_u16(server_type.unwrap() as u16);
+        // that ultimately encodes an empty/zero-length descriptor below. `server_type` is
+        // guaranteed `Some` here: `is_legacy_lob_override` only returns `true` for
+        // `Some(ColumnType::Byte) | Some(ColumnType::Text)`, checked just above.
+        buf.put_u16(server_type.expect("is_legacy_lob_override guarantees Some") as u16);
 
         match self {
             Self::Null => {

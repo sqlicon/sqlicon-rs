@@ -77,6 +77,22 @@ struct PoolInner {
     semaphore: Arc<Semaphore>,
 }
 
+impl PoolInner {
+    /// Locks `idle_queue`, recovering from poisoning rather than propagating the panic.
+    ///
+    /// A poisoned lock here only means some other task panicked while holding it; every
+    /// critical section under this lock is a few panic-free `VecDeque` operations, so
+    /// poisoning should not happen in practice. If it ever does, recovering the queue is
+    /// still safe to keep using: it is just a cache of idle connections, so a stale or lost
+    /// entry costs at most one extra `Connection::connect` round trip, not a correctness
+    /// issue.
+    fn lock_idle_queue(&self) -> std::sync::MutexGuard<'_, VecDeque<IdleConnection>> {
+        self.idle_queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
 /// An asynchronous, thread-safe connection pool for Informix.
 #[derive(Clone)]
 pub struct ConnectionPool {
@@ -109,7 +125,7 @@ impl ConnectionPool {
             let warmup_count = pool.inner.options.min_idle.min(max_connections);
             for _ in 0..warmup_count {
                 let conn = Connection::connect(pool.inner.params.clone()).await?;
-                let mut q = pool.inner.idle_queue.lock().unwrap();
+                let mut q = pool.inner.lock_idle_queue();
                 q.push_back(IdleConnection {
                     conn,
                     last_used: Instant::now(),
@@ -140,7 +156,7 @@ impl ConnectionPool {
         // Try to pop an existing idle connection
         loop {
             let item_opt = {
-                let mut q = self.inner.idle_queue.lock().unwrap();
+                let mut q = self.inner.lock_idle_queue();
                 q.pop_front()
             };
 
@@ -177,7 +193,7 @@ impl ConnectionPool {
 
     /// Returns the number of currently idle connections in the pool.
     pub async fn idle_count(&self) -> usize {
-        let q = self.inner.idle_queue.lock().unwrap();
+        let q = self.inner.lock_idle_queue();
         q.len()
     }
 
@@ -219,7 +235,7 @@ impl Drop for PooledConnection {
         // window, matching libsqli's fixed-size slot array, which cannot be over-provisioned.
         if let Some(conn) = self.conn.take() {
             if conn.is_alive() {
-                let mut q = self.pool.idle_queue.lock().unwrap();
+                let mut q = self.pool.lock_idle_queue();
                 q.push_back(IdleConnection {
                     conn,
                     last_used: Instant::now(),
