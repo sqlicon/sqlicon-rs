@@ -29,6 +29,16 @@ fn test_uri_onsoctcp_default_db_and_url_decoding() {
 }
 
 #[test]
+fn test_uri_url_decoding_multibyte_utf8() {
+    // %C3%A9 is the two-byte UTF-8 encoding of 'é'; byte-by-byte decoding
+    // (treating each decoded byte as its own char) would mangle this.
+    let uri = "informix+onsoctcp://caf%C3%A9:p%C3%A4ss@db-host:9088/?INFORMIXSERVER=srv";
+    let params = ConnectParams::from_uri(uri).expect("Should parse URI with UTF-8 userinfo");
+    assert_eq!(params.username, "café");
+    assert_eq!(params.password, "päss");
+}
+
+#[test]
 fn test_uri_invalid_cases() {
     // Missing '://'
     assert!(ConnectParams::from_uri("not-a-uri").is_err());

@@ -205,7 +205,7 @@ impl ConnectParams {
 }
 
 fn percent_decode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
+    let mut out = Vec::with_capacity(s.len());
     let mut bytes = s.bytes();
     while let Some(b) = bytes.next() {
         if b == b'%' {
@@ -215,17 +215,17 @@ fn percent_decode(s: &str) -> String {
                 let hex_str = [c1, c2];
                 if let Ok(hex_s) = std::str::from_utf8(&hex_str) {
                     if let Ok(val) = u8::from_str_radix(hex_s, 16) {
-                        out.push(val as char);
+                        out.push(val);
                         continue;
                     }
                 }
             }
-            out.push('%');
+            out.push(b'%');
         } else if b == b'+' {
-            out.push(' ');
+            out.push(b' ');
         } else {
-            out.push(b as char);
+            out.push(b);
         }
     }
-    out
+    String::from_utf8_lossy(&out).into_owned()
 }
