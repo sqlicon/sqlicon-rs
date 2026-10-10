@@ -175,6 +175,9 @@ pub enum Error {
 
     #[error("Configuration error: {0}")]
     Configuration(String),
+
+    #[error("No more rows available")]
+    Eof,
 }
 
 impl Error {
@@ -194,6 +197,7 @@ impl Error {
             Self::Canceled => Status::Canceled,
             Self::Unsupported(_) => Status::Unsupported,
             Self::Configuration(_) => Status::InvalidArgument,
+            Self::Eof => Status::Eof,
         }
     }
 }

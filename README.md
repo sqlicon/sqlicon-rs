@@ -27,7 +27,7 @@ A pure, asynchronous IBM Informix Dynamic Server client library and CLI written 
   - **Smart Large Objects (SLOB)**: Complete `BLOB` and `CLOB` support with random-access seeking, chunked reading, streaming writes (`SQ_LODATA`), and creation via the `ifx_lo_create` fastpath (`SQ_GETROUTINE` + `SQ_EXFPROUTINE`, [`Connection::sblob_create`](src/connection/client.rs)).
   - **Legacy `BYTE` / `TEXT`**: Parameters bound against a server-declared legacy placeholder are sent as a 56-byte LOB descriptor with the bytes streamed separately (`SQ_BBIND`), and fetched values are materialized through `SQ_FETCHBLOB` while the cursor is open, so row getters return the data rather than the locator.
 - **Full Database Charset & GLS Support**: Automatic conversion between database encoding (`DB_LOCALE` such as `de_DE.1252` / Windows-1252, ISO-8859-1..15, Shift-JIS, GB2312, Big5, etc.) and Rust UTF-8 `String`s.
-- **Prepared Statements & Parameter Binding**: Fast binary parameter encoding (`?` placeholders) and batched execution.
+- **Prepared Statements & Parameter Binding**: Fast binary parameter encoding (`?` placeholders) and batched execution. An optional `sqlx`-style fluent builder (`sqlicon_rs::query(sql).bind(x).fetch_all(&mut conn)`) is layered on top for a more familiar call shape.
 - **Stored Procedure / Function Calls**: `Connection::call_prepare`/`call_execute` wrap `EXECUTE PROCEDURE`/`EXECUTE FUNCTION` (no dedicated wire opcodes are needed -- just the ordinary prepare/bind/execute path keyed on the statement-type-56 output-column check), with `IN`/`OUT`/`INOUT` parameter-mode bookkeeping (`CallStatement::set_param_mode`/`out_column_index`) mirroring `libsqli`'s `sqli_call` API.
 - **Scrollable / Absolute Cursor Fetch**: `Connection::query_scrollable`/`query_stmt_scrollable` open a cursor with `SQ_SCROLL` and return a [`ScrollCursor`](src/result/scroll.rs) supporting `first`/`last`/`absolute(n)`/`relative(offset)`/`previous`/`next` navigation via `SQ_SFETCH`, matching `libsqli`'s scroll-insensitive cursor support.
 - **Transactions & Savepoints**: ANSI and Informix transactions (`begin`, `commit`, `rollback`, or the `#[must_use]`-enforced `Connection::transaction()` -> `Transaction` scope), named savepoints (`savepoint_set`, `savepoint_release`, `savepoint_rollback`), and isolation levels (`CommittedRead`, `RepeatableRead`, `Serializable`, `CursorStability`).
@@ -167,6 +167,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for row in &result.rows {
         println!("Found: {} - {}", row.get_display_value(0)?, row.get_display_value(1)?);
+    }
+
+    Ok(())
+}
+```
+
+### Fluent Query Builder (`sqlx`-style)
+
+For a more familiar shape if you're coming from `sqlx`, `sqlicon_rs::query(sql)` returns a
+builder: chain `.bind(value)` calls, then finish with `.execute()`/`.fetch_all()`/
+`.fetch_one()`/`.fetch_optional()`, passing the connection to the terminal call (mirroring
+`sqlx::query(sql).bind(x).fetch_all(&pool)`). It prepares `sql` fresh on every terminal
+call; reach for `Connection::prepare` plus `execute_stmt`/`query_stmt` directly instead when
+a statement is run many times and should only be parsed once.
+
+```rust
+use sqlicon_rs::{query, Connection, Error};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut conn = Connection::connect_uri("informix+onsoctcp://informix:secret@127.0.0.1:9089/stores7?INFORMIXSERVER=ol_iep").await?;
+
+    query("INSERT INTO customer (customer_num, fname) VALUES (?, ?)")
+        .bind(101)
+        .bind("Alice")
+        .execute(&mut conn)
+        .await?;
+
+    let rows = query("SELECT fname FROM customer WHERE credit_limit > ?")
+        .bind(5000)
+        .fetch_all(&mut conn)
+        .await?;
+    for row in &rows.rows {
+        println!("{}", row.get_display_value(0)?);
+    }
+
+    // fetch_one() returns Error::Eof if no row matched; fetch_optional() returns Ok(None) instead.
+    match query("SELECT fname FROM customer WHERE customer_num = ?").bind(101).fetch_one(&mut conn).await {
+        Ok(row) => println!("Found: {}", row.get_display_value(0)?),
+        Err(Error::Eof) => println!("No matching customer"),
+        Err(e) => return Err(e.into()),
     }
 
     Ok(())
