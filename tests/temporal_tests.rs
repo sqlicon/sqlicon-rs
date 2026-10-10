@@ -1,7 +1,7 @@
 use sqlicon_rs::types::date::{date_decode_wire, date_encode_wire, Date};
 use sqlicon_rs::types::datetime::{
     datetime_decode_wire, datetime_encode_wire, interval_decode_wire,
-    interval_encode_wire, temporal_wire_size, DateTime, TemporalField, TemporalRange,
+    interval_encode_wire, temporal_wire_size, DateTime, Interval, TemporalField, TemporalRange,
 };
 
 #[test]
@@ -246,4 +246,133 @@ fn test_datetime_display_is_range_aware() {
     let len = datetime_encode_wire(&value, full_fraction_qual, &mut buf).expect("encode");
     let decoded = datetime_decode_wire(&buf[..len], full_fraction_qual).expect("decode");
     assert_eq!(decoded.to_string(), "2026-06-20T12:34:56.120");
+}
+
+/// Regression tests for libsqli's validate_fields() semantic checks (sqli_temporal.c),
+/// which previously had no Rust equivalent: a malformed wire payload or a caller-built
+/// value with an impossible calendar/clock field used to be accepted silently.
+#[test]
+fn test_datetime_rejects_out_of_range_fields() {
+    let full_datetime: u16 = 0x0E0A; // YEAR TO SECOND
+
+    // Valid fixture from test_datetime_fixtures, for reference: month byte is raw[3].
+    let mut raw = [0xc7, 20, 26, 6, 20, 12, 34, 56];
+    assert!(datetime_decode_wire(&raw, full_datetime).is_ok());
+
+    // Corrupt the month field to 99 (still a structurally valid base-100 digit, <100,
+    // so it passes unpack() -- only the new semantic validation catches it).
+    raw[3] = 99;
+    let err = datetime_decode_wire(&raw, full_datetime).unwrap_err();
+    assert!(matches!(err, sqlicon_rs::Error::OutOfRange(_)), "got {err:?}");
+
+    // Same check on the encode path: a caller-built DateTime with an invalid month must
+    // be rejected before it is ever sent to the server.
+    let bad = DateTime {
+        range: TemporalRange {
+            first: TemporalField::Year,
+            last: TemporalField::Second,
+            fractional_digits: 0,
+        },
+        year: 2026,
+        month: 99,
+        day: 20,
+        hour: 12,
+        minute: 34,
+        second: 56,
+        nanosecond: 0,
+        is_null: false,
+    };
+    let mut buf = [0u8; 8];
+    let err = datetime_encode_wire(&bad, full_datetime, &mut buf).unwrap_err();
+    assert!(matches!(err, sqlicon_rs::Error::OutOfRange(_)), "got {err:?}");
+}
+
+#[test]
+fn test_datetime_rejects_invalid_day_of_month() {
+    let full_datetime: u16 = 0x0E0A; // YEAR TO SECOND
+    let bad = DateTime {
+        range: TemporalRange {
+            first: TemporalField::Year,
+            last: TemporalField::Second,
+            fractional_digits: 0,
+        },
+        year: 2025, // not a leap year
+        month: 2,
+        day: 29,
+        hour: 0,
+        minute: 0,
+        second: 0,
+        nanosecond: 0,
+        is_null: false,
+    };
+    let mut buf = [0u8; 8];
+    let err = datetime_encode_wire(&bad, full_datetime, &mut buf).unwrap_err();
+    assert!(matches!(err, sqlicon_rs::Error::OutOfRange(_)), "got {err:?}");
+
+    // 2024 is a leap year: Feb 29 is valid.
+    let good = DateTime { year: 2024, ..bad };
+    assert!(datetime_encode_wire(&good, full_datetime, &mut buf).is_ok());
+}
+
+#[test]
+fn test_datetime_rejects_out_of_range_hour_minute_second() {
+    let full_datetime: u16 = 0x0E0A; // YEAR TO SECOND
+    let base = DateTime {
+        range: TemporalRange {
+            first: TemporalField::Year,
+            last: TemporalField::Second,
+            fractional_digits: 0,
+        },
+        year: 2026,
+        month: 6,
+        day: 20,
+        hour: 0,
+        minute: 0,
+        second: 0,
+        nanosecond: 0,
+        is_null: false,
+    };
+    let mut buf = [0u8; 8];
+    for bad in [
+        DateTime { hour: 24, ..base.clone() },
+        DateTime { minute: 60, ..base.clone() },
+        DateTime { second: 60, ..base.clone() },
+    ] {
+        let err = datetime_encode_wire(&bad, full_datetime, &mut buf).unwrap_err();
+        assert!(matches!(err, sqlicon_rs::Error::OutOfRange(_)), "got {err:?}");
+    }
+}
+
+#[test]
+fn test_interval_rejects_out_of_range_fields() {
+    // HOUR TO SECOND interval (2 leading digits on HOUR): hour is the leading field
+    // (unrestricted), minute/second are bound to 0..=59.
+    let hour_to_second: u16 = 0x066A;
+    let base = Interval {
+        range: TemporalRange {
+            first: TemporalField::Hour,
+            last: TemporalField::Second,
+            fractional_digits: 0,
+        },
+        years: 0,
+        months: 0,
+        days: 0,
+        hours: 5,
+        minutes: 0,
+        seconds: 0,
+        nanosecond: 0,
+        negative: false,
+        is_null: false,
+    };
+    let mut buf = [0u8; 4];
+    assert!(interval_encode_wire(&base, hour_to_second, &mut buf).is_ok());
+
+    let bad_minute = Interval { minutes: 60, ..base.clone() };
+    let err = interval_encode_wire(&bad_minute, hour_to_second, &mut buf).unwrap_err();
+    assert!(matches!(err, sqlicon_rs::Error::OutOfRange(_)), "got {err:?}");
+
+    // The leading HOUR field isn't bound to DATETIME's 0..=23 cap (it's an interval
+    // magnitude, here limited only by the qualifier's 2 leading digits, i.e. <= 99).
+    let big_hour = Interval { hours: 50, ..base };
+    assert!(interval_encode_wire(&big_hour, hour_to_second, &mut buf).is_ok());
 }

@@ -349,6 +349,106 @@ fn pack(fields: &WireFields, range: &WireRange, bytes: &mut [u8]) -> Result<usiz
     Ok(range.width)
 }
 
+fn leap_year(year: i32) -> bool {
+    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+}
+
+/// Matches `libsqli`'s `month_days()` (`sqli_temporal.c`): year 0 means "absent" (the
+/// qualifier range doesn't include YEAR), so February is treated as possibly a leap day.
+fn month_days(month: u32, year: i32) -> u32 {
+    const DAYS: [u32; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    if month == 2 && (year == 0 || leap_year(year)) {
+        29
+    } else {
+        DAYS[(month - 1) as usize]
+    }
+}
+
+/// Matches `libsqli`'s `validate_fields()` (`sqli_temporal.c`): rejects field magnitudes the
+/// qualifier range doesn't cover, out-of-bounds calendar/clock fields, an impossible
+/// day-of-month, and a fractional value that doesn't fit the qualifier's declared precision.
+/// Applied on both decode (reject a malformed wire payload) and encode (reject a caller-built
+/// value before it is ever sent to the server).
+fn validate_temporal_fields(fields: &WireFields, range: &TemporalRange, interval: bool) -> Result<()> {
+    if fields.is_null {
+        return Ok(());
+    }
+
+    let first = range.first as u8;
+    let last = range.last as u8;
+
+    for field_num in (TemporalField::Year as u8)..=(TemporalField::Second as u8) {
+        let magnitude = fields.fields[field_num as usize];
+        if field_num < first || field_num > last {
+            if magnitude != 0 {
+                return Err(Error::Protocol(format!(
+                    "Temporal field {field_num} set but outside qualifier range"
+                )));
+            }
+            continue;
+        }
+        if interval && field_num == first {
+            // The leading field of an INTERVAL carries the "leading digits" magnitude,
+            // which has no fixed range (e.g. up to 9 digits of days).
+            continue;
+        }
+
+        let minimum: u64 = if !interval && field_num <= TemporalField::Day as u8 { 1 } else { 0 };
+        let maximum: u64 = if field_num == TemporalField::Year as u8 {
+            9999
+        } else if field_num == TemporalField::Month as u8 {
+            if interval { 11 } else { 12 }
+        } else if field_num == TemporalField::Day as u8 {
+            31
+        } else if field_num == TemporalField::Hour as u8 {
+            23
+        } else if field_num == TemporalField::Minute as u8 {
+            59
+        } else {
+            59 // Second
+        };
+
+        if magnitude < minimum || magnitude > maximum {
+            return Err(Error::OutOfRange(format!(
+                "Temporal field {field_num} value {magnitude} outside [{minimum}, {maximum}]"
+            )));
+        }
+    }
+
+    if !interval {
+        let month = fields.fields[TemporalField::Month as usize];
+        let day = fields.fields[TemporalField::Day as usize];
+        if month != 0 && day != 0 {
+            let year = fields.fields[TemporalField::Year as usize] as i32;
+            if day > month_days(month as u32, year) as u64 {
+                return Err(Error::OutOfRange(format!(
+                    "Day {day} exceeds days in month {month} for year {year}"
+                )));
+            }
+        }
+    }
+
+    if range.last != TemporalField::Fraction {
+        if fields.nanosecond != 0 {
+            return Err(Error::Protocol(
+                "Fractional seconds set but outside qualifier range".into(),
+            ));
+        }
+    } else {
+        if fields.nanosecond >= 1_000_000_000 {
+            return Err(Error::OutOfRange("Fractional nanoseconds out of range".into()));
+        }
+        let factor = power10(9 - (range.fractional_digits as u32));
+        if fields.nanosecond % factor != 0 {
+            return Err(Error::Inexact(
+                "Fractional value exceeds qualifier's declared precision".into(),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 /// Qualified calendar datetime representation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DateTime {
@@ -388,6 +488,7 @@ pub fn datetime_decode_wire(bytes: &[u8], qualifier: u16) -> Result<DateTime> {
     if fields.fields[TemporalField::Year as usize] > LAST_YEAR as u64 {
         return Err(Error::Protocol("Year exceeds 9999".into()));
     }
+    validate_temporal_fields(&fields, &range.range, false)?;
 
     Ok(DateTime {
         range: range.range,
@@ -418,6 +519,7 @@ pub fn datetime_encode_wire(value: &DateTime, qualifier: u16, bytes: &mut [u8]) 
         negative: false,
         is_null: value.is_null,
     };
+    validate_temporal_fields(&wf, &range.range, false)?;
     pack(&wf, &range, bytes)
 }
 
@@ -439,6 +541,7 @@ pub struct Interval {
 pub fn interval_decode_wire(bytes: &[u8], qualifier: u16) -> Result<Interval> {
     let range = decode_range(qualifier, true)?;
     let fields = unpack(bytes, &range)?;
+    validate_temporal_fields(&fields, &range.range, true)?;
 
     Ok(Interval {
         range: range.range,
@@ -594,6 +697,7 @@ pub fn interval_encode_wire(value: &Interval, qualifier: u16, bytes: &mut [u8]) 
         negative: value.negative,
         is_null: value.is_null,
     };
+    validate_temporal_fields(&wf, &range.range, true)?;
     pack(&wf, &range, bytes)
 }
 
