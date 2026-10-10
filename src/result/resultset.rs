@@ -66,6 +66,23 @@ impl QueryResult {
     }
 }
 
+/// Outcome of a non-row-returning statement execution
+/// ([`Connection::execute`](crate::connection::client::Connection::execute)/
+/// [`execute_stmt`](crate::connection::client::Connection::execute_stmt)).
+///
+/// Replaces returning a bare `i64` plus a separate, stateful
+/// `Connection::last_generated_serial()` accessor the caller had to remember to read
+/// immediately (it gets overwritten by the next operation) -- the generated serial now
+/// travels with the result it belongs to, the same way [`QueryResult::generated_serial`]
+/// already does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecuteResult {
+    /// Number of rows affected.
+    pub rows_affected: i64,
+    /// Auto-generated `SERIAL`, `SERIAL8`, or `BIGSERIAL` key value, if applicable.
+    pub generated_serial: Option<i64>,
+}
+
 impl IntoIterator for QueryResult {
     type Item = Row;
     type IntoIter = std::vec::IntoIter<Row>;

@@ -90,11 +90,11 @@ async fn test_live_transactions_and_savepoints() {
     assert_eq!(stmt.parameter_count(), 2);
 
     let params_row = [ParameterValue::Int(10), ParameterValue::String("param_bound".into())];
-    let affected = conn
+    let result = conn
         .execute_stmt(&stmt, &params_row)
         .await
         .expect("execute_stmt failed");
-    assert_eq!(affected, 1);
+    assert_eq!(result.rows_affected, 1);
 
     let res4 = conn
         .query(&format!("SELECT val FROM {} WHERE id = 10", tbl))

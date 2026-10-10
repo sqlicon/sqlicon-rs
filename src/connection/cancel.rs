@@ -111,6 +111,10 @@ pub struct CancelSnapshot {
     pub outcome: CancelOutcome,
     /// The connection is permanently unusable, even if cleanup failed.
     pub connection_discarded: bool,
+    /// Auto-generated `SERIAL`/`SERIAL8`/`BIGSERIAL` key value, if the statement ran to a
+    /// terminal `SQ_DONE` (`outcome == Executed`) and inserted into such a column. `None`
+    /// for every other outcome, since there is no row to have generated one.
+    pub generated_serial: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

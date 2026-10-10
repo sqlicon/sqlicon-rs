@@ -104,6 +104,9 @@ impl CallStatement {
 pub struct CallResult {
     /// Rows affected, for a call with no output columns.
     pub rows_affected: i64,
+    /// Auto-generated `SERIAL`/`SERIAL8`/`BIGSERIAL` key value, if the call (whether or not
+    /// it produced an output row) inserted into such a column.
+    pub generated_serial: Option<i64>,
     /// The single output row, present only when the call's `DESCRIBE` reported output
     /// columns (statement type 56 with a non-empty column list -- see
     /// [`PreparedStatement::is_query`]).

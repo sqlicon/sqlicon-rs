@@ -580,9 +580,9 @@ async fn execute_statement(
             eprintln!("Run Time: {:0.3}s", elapsed.as_secs_f64());
         }
     } else {
-        let affected = conn.execute(trimmed).await?;
+        let result = conn.execute(trimmed).await?;
         let elapsed = start.elapsed();
-        let _ = writeln!(writer, "{affected} row(s) affected");
+        let _ = writeln!(writer, "{} row(s) affected", result.rows_affected);
         if rt.timer_on {
             eprintln!("Run Time: {:0.3}s", elapsed.as_secs_f64());
         }
