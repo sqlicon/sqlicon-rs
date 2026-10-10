@@ -819,20 +819,21 @@ async fn dump_table_inserts(conn: &mut Connection, out: &mut dyn Write, table: &
     Ok(())
 }
 
-async fn handle_dot_command(
-    conn: &mut Connection,
-    rt: &mut ShellRuntime,
-    line: &str,
-) -> Result<bool, Box<dyn std::error::Error>> {
-    let mut parts = line.split_whitespace();
-    let cmd = parts.next().unwrap_or("");
-    let arg = line.strip_prefix(cmd).unwrap_or("").trim();
+fn handle_dot_command<'a>(
+    conn: &'a mut Connection,
+    rt: &'a mut ShellRuntime,
+    line: &'a str,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, Box<dyn std::error::Error>>> + 'a>> {
+    Box::pin(async move {
+        let mut parts = line.split_whitespace();
+        let cmd = parts.next().unwrap_or("");
+        let arg = line.strip_prefix(cmd).unwrap_or("").trim();
 
-    match cmd {
-        ".quit" | ".exit" => return Ok(true),
-        ".help" => {
-            println!("Dot commands:");
-            println!("  .help                 Show this help");
+        match cmd {
+            ".quit" | ".exit" => return Ok(true),
+            ".help" => {
+                println!("Dot commands:");
+                println!("  .help                 Show this help");
             println!("  .quit | .exit         Exit shell");
             println!("  .mode MODE            Set output mode: aligned|csv|line|json|markdown");
             println!("  .width IDX WIDTH      Set minimum column width for IDX (1-based)");
@@ -1386,10 +1387,18 @@ async fn handle_dot_command(
         }
     }
     Ok(false)
+    })
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(4 * 1024 * 1024)
+        .build()?;
+    rt.block_on(async_main())
+}
+
+async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     let args = match parse_cli_args() {
         Ok(a) => a,
         Err(e) => {
