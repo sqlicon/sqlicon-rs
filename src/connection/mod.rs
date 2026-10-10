@@ -13,7 +13,7 @@ pub use cancel::{CancelDisposition, CancelOperation, CancelOutcome, CancelReques
 pub use capabilities::ServerCapabilities;
 pub use client::{BatchItemResult, BatchResult, Connection, ConnectionState, IsolationLevel};
 pub use handshake::*;
-pub use params::ConnectParams;
+pub use params::{ConnectParams, SslMode};
 pub use pool::{ConnectionPool, PoolOptions, PooledConnection};
 pub use sblob::{SblobHandle, SblobOpenMode, SblobOptions, SblobType, IFX_LO_SPEC_SIZE, SBLOB_LOCATOR_MAX};
 pub use sqlhosts::{find_sqlhosts_entry, parse_sqlhosts, SqlhostsEntry};

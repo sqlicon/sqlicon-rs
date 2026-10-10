@@ -104,7 +104,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ### TLS-Encrypted Connection (`onsocssl`)
 
 ```rust
-use sqlicon_rs::{ConnectParams, Connection};
+use sqlicon_rs::{ConnectParams, Connection, SslMode};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -118,7 +118,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let params = ConnectParams::new("127.0.0.1", "9443", "ol_iep")
         .database("stores7")
         .credentials("informix", "secret")
-        .ssl(true, true)
+        .ssl(SslMode::EnabledVerifyPeer)
         .ssl_ca_file("/etc/ssl/certs/informix-ca.pem");
     let _conn2 = Connection::connect(params).await?;
 
@@ -158,14 +158,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut conn = Connection::connect_uri("informix+onsoctcp://informix:secret@127.0.0.1:9089/stores7?INFORMIXSERVER=ol_iep").await?;
 
     // Prepare statement with placeholders
-    let mut stmt = conn.prepare("SELECT customer_num, fname FROM customer WHERE customer_num = ? AND active = ?").await?;
+    let stmt = conn.prepare("SELECT customer_num, fname FROM customer WHERE customer_num = ? AND credit_limit > ?").await?;
 
-    // Bind parameters and execute
-    let params = vec![
-        ParameterValue::Integer(101),
-        ParameterValue::Boolean(true),
-    ];
-    let result = conn.execute_prepared(&mut stmt, &params).await?;
+    // Bind parameters and execute -- every scalar ParameterValue variant has a `From` impl,
+    // so plain Rust values convert via `.into()` instead of naming the variant.
+    let params: Vec<ParameterValue> = vec![101.into(), 5000.into()];
+    let result = conn.query_stmt(&stmt, &params).await?;
 
     for row in &result.rows {
         println!("Found: {} - {}", row.get_display_value(0)?, row.get_display_value(1)?);

@@ -5,7 +5,7 @@
 //! libsqli's `sqli_tls_connect` wraps the raw socket in OpenSSL before any SQLI bytes flow.
 
 use rcgen::{generate_simple_self_signed, CertifiedKey};
-use sqlicon_rs::{ConnectParams, SqliStream};
+use sqlicon_rs::{ConnectParams, SqliStream, SslMode};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -61,7 +61,7 @@ async fn connect_tls_without_verification_completes_handshake_over_self_signed_c
 
     // ssl_verify_peer=false: libsqli's SSL_VERIFY_NONE equivalent. The handshake must still
     // actually negotiate a TLS session (not a plaintext passthrough).
-    let params = ConnectParams::new("localhost", port.to_string(), "x").ssl(true, false);
+    let params = ConnectParams::new("localhost", port.to_string(), "x").ssl(SslMode::Enabled);
     let mut stream = SqliStream::connect_tls("localhost", port, &params)
         .await
         .expect("TLS connect without verification should still complete a real handshake");
@@ -82,7 +82,7 @@ async fn connect_tls_with_verification_and_no_matching_ca_is_rejected() {
     // ssl_verify_peer=true with no ssl_ca_file falls back to the platform's native trust
     // store, which will never contain this throwaway self-signed cert -- certificate
     // validation must actually reject the connection, not silently accept it.
-    let params = ConnectParams::new("localhost", port.to_string(), "x").ssl(true, true);
+    let params = ConnectParams::new("localhost", port.to_string(), "x").ssl(SslMode::EnabledVerifyPeer);
     let result = SqliStream::connect_tls("localhost", port, &params).await;
     assert!(
         result.is_err(),
@@ -103,7 +103,7 @@ async fn connect_tls_with_verification_and_matching_ca_file_succeeds() {
     std::fs::write(&ca_path, pem).expect("failed to write test CA file");
 
     let params = ConnectParams::new("localhost", port.to_string(), "x")
-        .ssl(true, true)
+        .ssl(SslMode::EnabledVerifyPeer)
         .ssl_ca_file(ca_path.to_string_lossy().to_string());
     let mut stream = SqliStream::connect_tls("localhost", port, &params)
         .await

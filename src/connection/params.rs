@@ -1,5 +1,18 @@
 //! Connection parameters for Informix database connections.
 
+/// TLS mode for [`ConnectParams::ssl`]. Replaces two same-typed, easily-transposed `bool`
+/// parameters (`enable`, `verify_peer`) with a single value whose meaning is readable at
+/// the call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SslMode {
+    /// No TLS; plain `onsoctcp`.
+    Disabled,
+    /// TLS without certificate verification (OpenSSL's `SSL_VERIFY_NONE` equivalent).
+    Enabled,
+    /// TLS with full certificate chain and hostname verification.
+    EnabledVerifyPeer,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectParams {
     pub hostname: String,
@@ -75,9 +88,12 @@ impl ConnectParams {
 
     /// Enables TLS (`informix+onsocssl`-equivalent) and whether to verify the server's
     /// certificate chain and hostname. Matches libsqli's `ssl_enable`/`ssl_verify_peer`.
-    pub fn ssl(mut self, enable: bool, verify_peer: bool) -> Self {
-        self.ssl_enable = enable;
-        self.ssl_verify_peer = verify_peer;
+    pub fn ssl(mut self, mode: SslMode) -> Self {
+        (self.ssl_enable, self.ssl_verify_peer) = match mode {
+            SslMode::Disabled => (false, false),
+            SslMode::Enabled => (true, false),
+            SslMode::EnabledVerifyPeer => (true, true),
+        };
         self
     }
 
